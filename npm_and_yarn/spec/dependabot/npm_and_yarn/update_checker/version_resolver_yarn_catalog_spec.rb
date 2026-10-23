@@ -28,6 +28,63 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
     )
   end
 
+  describe "#catalog_version_resolvable?" do
+    let(:repo_contents_path) { nil }
+    let(:candidate_version) { Dependabot::NpmAndYarn::Version.new("2.8.6") }
+    let(:conflict) do
+      Dependabot::UpdateCheckers::PeerDependencyConflict.new(
+        requirement_name: "prettier", requirement_version: "2.8.6", requiring_dep_name: "formatting-plugin"
+      )
+    end
+    let(:previous_conflicts) { [] }
+
+    before do
+      allow(resolver).to receive(:fetch_peer_dependency_errors).with(version: candidate_version).and_return([conflict])
+      allow(resolver).to receive(:fetch_peer_dependency_errors)
+        .with(version: Dependabot::NpmAndYarn::Version.new("2.8.0")).and_return(previous_conflicts)
+    end
+
+    it "rejects a newly broken peer requirement on the catalog dependency" do
+      expect(resolver.catalog_version_resolvable?(candidate_version)).to be false
+    end
+
+    context "when the catalog dependency requires the incompatible peer" do
+      let(:conflict) do
+        Dependabot::UpdateCheckers::PeerDependencyConflict.new(
+          requirement_name: "formatting-plugin", requirement_version: "1.0.0", requiring_dep_name: "prettier"
+        )
+      end
+
+      it "rejects the newly broken peer requirement" do
+        expect(resolver.catalog_version_resolvable?(candidate_version)).to be false
+      end
+    end
+
+    context "when the same dependency pair already has a peer conflict" do
+      let(:previous_conflicts) do
+        [Dependabot::UpdateCheckers::PeerDependencyConflict.new(
+          requirement_name: "prettier", requirement_version: "2.8.0", requiring_dep_name: "formatting-plugin"
+        )]
+      end
+
+      it "allows the existing conflict at the candidate version" do
+        expect(resolver.catalog_version_resolvable?(candidate_version)).to be true
+      end
+    end
+
+    context "when a new peer conflict involves other dependencies" do
+      let(:conflict) do
+        Dependabot::UpdateCheckers::PeerDependencyConflict.new(
+          requirement_name: "other-package", requirement_version: "1.0.0", requiring_dep_name: "formatting-plugin"
+        )
+      end
+
+      it "allows the catalog dependency update" do
+        expect(resolver.catalog_version_resolvable?(candidate_version)).to be true
+      end
+    end
+  end
+
   it "probes the shared catalog with install and restores every fetched source file" do
     commands = []
     helpers = Dependabot::NpmAndYarn::Helpers
