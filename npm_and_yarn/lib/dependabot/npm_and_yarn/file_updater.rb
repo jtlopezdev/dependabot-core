@@ -10,6 +10,7 @@ require "dependabot/package/release_cooldown_options"
 require "dependabot/update_checkers/cooldown_calculation"
 require "dependabot/npm_and_yarn/dependency_files_filterer"
 require "dependabot/npm_and_yarn/sub_dependency_files_filterer"
+require "dependabot/npm_and_yarn/yarn_catalog_security_validation"
 require "dependabot/npm_and_yarn/version"
 require "sorbet-runtime"
 
@@ -56,6 +57,7 @@ module Dependabot
                          end
 
         handle_pnpm_support_file_no_change!(updated_files)
+        validate_yarn_catalog_security_updates!(updated_files)
 
         if updated_files.none?
           raise NoChangeError.new(
@@ -76,6 +78,18 @@ module Dependabot
       end
 
       private
+
+      sig { params(updated_files: T::Array[DependencyFile]).void }
+      def validate_yarn_catalog_security_updates!(updated_files)
+        return unless dependencies.any? { |dependency| dependency.metadata.key?(:yarn_catalog_security_contracts) }
+
+        files = dependency_files.map { |file| updated_files.find { |updated| updated.path == file.path } || file }
+        YarnCatalogSecurityValidation.validate!(
+          dependency_files: files,
+          dependencies: dependencies,
+          credentials: credentials
+        )
+      end
 
       sig { returns(T::Array[DependencyFile]) }
       def updated_yarn_catalog_files

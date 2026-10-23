@@ -106,6 +106,7 @@ module Dependabot
         # Avoid rejecting the source dependency
         next false if source_dependency_name && d.name == source_dependency_name
 
+        next false if verified_catalog_inventory_change?(d)
         next false if d.top_level? && d.requirements != d.previous_requirements
 
         d.version == d.previous_version
@@ -123,6 +124,17 @@ module Dependabot
     end
 
     private
+
+    sig { params(dependency: Dependabot::Dependency).returns(T::Boolean) }
+    def verified_catalog_inventory_change?(dependency)
+      return false unless dependency.package_manager == "npm_and_yarn" && dependency.informational_only? &&
+                          dependency.metadata.key?(:yarn_catalog_security_contracts)
+
+      previous_versions = dependency.metadata_string_array(:yarn_catalog_security_previous_versions)
+      return false unless previous_versions
+
+      previous_versions.sort != dependency.all_versions.compact.sort
+    end
 
     sig { returns(Dependabot::Job) }
     attr_reader :job

@@ -395,7 +395,18 @@ module Dependabot
       previous_version = parse_version_if_valid(dependency.previous_version, dependency.package_manager)
       return false unless previous_version
 
-      vulnerability?(dependency, [previous_version])
+      versions_to_check = [previous_version]
+      if dependency.package_manager == "npm_and_yarn" && dependency.metadata.key?(:yarn_catalog_security_contracts)
+        # A catalog security update can fix a vulnerable installed branch while
+        # its safe representative stays unchanged. Use the original inventory
+        # preserved by the verified update as well as that representative.
+        previous_versions = dependency.metadata_string_array(:yarn_catalog_security_previous_versions) || []
+        versions_to_check += previous_versions.filter_map do |version|
+          parse_version_if_valid(version, dependency.package_manager)
+        end
+      end
+
+      vulnerability?(dependency, versions_to_check)
     end
 
     sig { params(dependency: Dependabot::Dependency).returns(T::Boolean) }

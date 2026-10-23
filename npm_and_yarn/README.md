@@ -15,8 +15,19 @@ updated together. A package consumed through multiple catalog identities, or thr
 direct declaration, reports an unsupported feature. Catalog ranges resolved to local workspaces are excluded from
 registry updates. Inherited configuration, plugin catalogs, and selected YAML aliases or anchors are also outside this scope.
 
-Catalog edges participate in dependency graph and conflict traversal. Security updates for catalog dependencies
-and transitive updates in projects using catalogs are not yet supported. Ordinary direct security updates remain available.
+Catalog edges participate in dependency graph and conflict traversal. For transitive security updates requiring an
+ancestor change, security jobs make a bounded attempt using each ancestor's own policy, then verify every resolved
+target version. The final updater must preserve the preview's verified resolution set. Accumulated groups revalidate
+each target against its original policy and existing branches to retained older safe versions. Later changes must
+still satisfy that policy; updated ancestors cannot newly select otherwise disallowed versions. This path can report
+that no verified update is available; it does not search every combination of ancestor releases. It may also decline
+a standalone repair when a safe direct catalog dependency shares its package name with a vulnerable transitive
+resolution.
+
+Security verification also covers the complete installed inventory for direct and in-range transitive proposals.
+Grouped updates retain the initial target policy through incidental changes, including fixes that preserve a safe
+representative version and removal of vulnerable targets. Catalog security updates are unsupported when the lockfile
+contains an npm alias for the security target; aliases for unrelated packages do not prevent verification.
 
 ### Running locally
 
