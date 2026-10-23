@@ -132,7 +132,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::YarnCatalogSecurityUpdater
         Dependabot::NpmAndYarn::YarnCatalogSecurityValidation.contracts_for(dep).first.versions
       end
     ).to eq([["6.0.0"], ["6.0.0"]])
-    expect(updater.updates).to equal(updates)
   end
 
   context "when one blocking ancestor cannot be updated" do

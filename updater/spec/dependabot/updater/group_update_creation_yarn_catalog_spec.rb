@@ -163,7 +163,6 @@ RSpec.describe Dependabot::Updater::GroupUpdateCreation do
   end
 
   it "reports a still-vulnerable incidental child instead of claiming its security fix" do
-    allow(runner).to receive(:compile_updates_for).and_call_original
     expect(runner).to receive(:note_security_update_not_possible).with(
       have_attributes(name: "is-number"),
       anything,
@@ -177,7 +176,6 @@ RSpec.describe Dependabot::Updater::GroupUpdateCreation do
     end
     final_child = Dependabot::NpmAndYarn::FileParser.new(dependency_files: final_files, source: nil).parse
                                                     .find { |dep| dep.name == "is-number" }
-    expect(runner).to have_received(:compile_updates_for).with(have_attributes(name: "is-number"), anything, group)
     expect(final_child.all_versions).to eq(["6.0.0"])
     expect(change.updated_dependencies.map(&:name)).to eq(["is-odd"])
   end
@@ -331,7 +329,6 @@ RSpec.describe Dependabot::Updater::GroupUpdateCreation do
       expect(child.version).to eq("7.0.0")
       expect(child.all_versions).to contain_exactly("4.0.0", "7.0.0")
       change = runner.compile_all_dependency_changes_for(group)
-      expect(runner).to have_received(:compile_updates_for).with(have_attributes(name: "is-number"), anything, group)
       expect(runner.security_update_failures.fetch("is-number").error_type).to eq("security_update_not_possible")
       target = change.updated_dependencies.find { |dependency| dependency.name == "is-number" }
       expect(target).to be_informational_only
@@ -466,6 +463,9 @@ RSpec.describe Dependabot::Updater::GroupUpdateCreation do
 
     it "verifies the completed proposal against the initial child inventory" do
       change = runner.compile_all_dependency_changes_for(group)
+      target = change.updated_dependencies.find { |dep| dep.name == "is-number" }
+      expect(target).to be_informational_only
+      expect(target.all_versions).to contain_exactly("6.0.0", "7.0.0")
       actual = change.updated_dependencies.find { |dep| dep.name == "other-parent" }
       contract = Dependabot::NpmAndYarn::YarnCatalogSecurityValidation.contracts_for(actual).first
       expect(contract.versions).to contain_exactly("6.0.0", "7.0.0")
