@@ -170,14 +170,12 @@ module Dependabot
         # security fix version that does not require unlocking other dependencies.
         return latest_resolvable_transitive_security_fix_version_with_no_unlock unless dependency.top_level?
 
-        # For top-level dependencies, return the lowest security fix version.
-        # TODO: Consider checking resolvability here in the future.
+        # Catalog security fixes also need to satisfy peer requirements.
         version = lowest_security_fix_version
-        if version && dependency.requirements.any? do |requirement|
+        catalog_dependency = dependency.requirements.any? do |requirement|
           requirement.metadata_string("yarn_catalog_reference")
-        end && !version_resolver.catalog_version_resolvable?(version)
-          return nil
         end
+        return nil if version && catalog_dependency && !version_resolver.catalog_version_resolvable?(version)
 
         version
       end

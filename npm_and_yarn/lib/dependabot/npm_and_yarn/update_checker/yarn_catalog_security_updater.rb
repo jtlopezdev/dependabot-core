@@ -144,7 +144,7 @@ module Dependabot
           return unless minimum
 
           catalogs = YarnCatalogs.new(dependency_files: @dependency_files)
-          parents = blocking_ancestors(catalogs, minimum)
+          parents = blocking_ancestors(minimum)
           return if parents.empty?
 
           # Validate every ancestor before starting any candidate installation.
@@ -240,7 +240,7 @@ module Dependabot
           end
           return true if retained.empty?
 
-          original = relationships(@dependency_files)
+          original = original_relationships
           # Grandfather only existing edges to safe but otherwise disallowed
           # versions. An updated ancestor must not newly select one of them.
           relationships(files).all? do |parent, children|
@@ -253,6 +253,14 @@ module Dependabot
           catalogs = YarnCatalogs.new(dependency_files: files)
           lockfile = T.must(files.find { |file| file.name == "yarn.lock" })
           DependencyGrapher::YarnRelationshipResolver.new(lockfile, catalogs: catalogs.helper_catalogs).relationships
+        end
+
+        sig { returns(T::Hash[String, T::Array[String]]) }
+        def original_relationships
+          @original_relationships ||= T.let(
+            relationships(@dependency_files),
+            T.nilable(T::Hash[String, T::Array[String]])
+          )
         end
 
         sig { returns(T::Array[String]) }
@@ -315,7 +323,7 @@ module Dependabot
         end
         def resolution_contract(versions, minimum)
           retained = unchanged_safe_versions - permitted_new_versions(minimum)
-          edges = relationships(@dependency_files).flat_map do |parent, children|
+          edges = original_relationships.flat_map do |parent, children|
             children.filter_map do |child|
               [parent, child].to_json if retained.any? { |version| child == "#{@dependency.name}@#{version}" }
             end
@@ -325,8 +333,8 @@ module Dependabot
           )
         end
 
-        sig { params(catalogs: YarnCatalogs, minimum: Dependabot::Version).returns(T::Array[Dependency]) }
-        def blocking_ancestors(catalogs, minimum)
+        sig { params(minimum: Dependabot::Version).returns(T::Array[Dependency]) }
+        def blocking_ancestors(minimum)
           vulnerable = vulnerable_target_nodes
           conflicts = ConflictingDependencyResolver.new(dependency_files: @dependency_files, credentials: @credentials)
                                                    .conflicting_dependencies(
@@ -337,11 +345,7 @@ module Dependabot
                                                      end
                                                    )
           blockers = conflicts.map { |conflict| "#{conflict.fetch('name')}@#{conflict.fetch('version')}" }
-          lockfile = T.must(@dependency_files.find { |file| file.name == "yarn.lock" })
-          graph = DependencyGrapher::YarnRelationshipResolver.new(
-            lockfile,
-            catalogs: catalogs.helper_catalogs
-          ).relationships
+          graph = original_relationships
           # Conflicts on unchanged safe branches do not require an ancestor
           # update. Their original resolutions and edges are verified later.
           blockers.select! { |parent| graph.fetch(parent, []).intersect?(vulnerable) }
