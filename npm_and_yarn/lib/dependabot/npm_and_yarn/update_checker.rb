@@ -70,6 +70,14 @@ module Dependabot
         @package_json = T.let(nil, T.nilable(Dependabot::DependencyFile))
         @git_commit_checker = T.let(nil, T.nilable(Dependabot::GitCommitChecker))
         super
+        catalogs = YarnCatalogs.new(dependency_files: dependency_files)
+        catalogs.validate_update!(dependency.name)
+        if security_advisories.any? && catalogs.bindings.any? &&
+           (!dependency.top_level? || catalogs.bindings.any? { |binding| binding.name == dependency.name })
+          raise ToolFeatureNotSupported.new(
+            tool_name: "yarn", tool_type: "package_manager", feature: "security updates for Yarn catalogs"
+          )
+        end
         Helpers.dependency_files = dependency_files
         Helpers.credentials = credentials
         Helpers.activate_npm_version_selector(dependency_files)

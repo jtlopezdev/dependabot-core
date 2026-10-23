@@ -585,6 +585,13 @@ module Dependabot
         handle_subprocess_failure(e)
       end
 
+      # Capability checks must precede config commands: an older Yarn rejects
+      # unknown settings such as native catalogs during configuration setup.
+      sig { returns(String) }
+      def self.yarn_version
+        run_single_yarn_command("--version").strip
+      end
+
       sig { params(error: StandardError).returns(T.noreturn) }
       def self.handle_subprocess_failure(error)
         message = error.message

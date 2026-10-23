@@ -41,6 +41,109 @@ RSpec.describe Dependabot::NpmAndYarn::FileParser do
 
   it_behaves_like "a dependency file parser"
 
+  describe "Yarn catalogs" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_workspace") }
+
+    it "preserves a custom registry source recorded in the effective lock descriptor" do
+      lock = files.find { |file| file.name == "yarn.lock" }
+      archive = CGI.escape("https://registry.example.com/prettier/-/prettier-2.8.0.tgz")
+      lock.content = lock.content.sub(
+        'resolution: "prettier@npm:2.8.0"',
+        "resolution: \"prettier@npm:2.8.0::__archiveUrl=#{archive}\""
+      )
+      dependency = parser.parse.find { |dep| dep.name == "prettier" }
+      expect(dependency.requirements.first.source).to eq(type: "registry", url: "https://registry.example.com")
+    end
+
+    it "reports the consumed definition and groups without treating unused definitions as dependencies" do
+      dependency = parser.parse.find { |dep| dep.name == "prettier" }
+
+      expect(dependency).to have_attributes(version: "2.8.0")
+      expect(dependency.requirements).to eq(
+        [{
+          requirement: "2.8.0",
+          file: ".yarnrc.yml",
+          groups: %w(devDependencies dependencies),
+          source: nil,
+          metadata: { yarn_catalog_reference: "catalog:", yarn_catalog_package: "prettier" }
+        }]
+      )
+    end
+
+    context "with a catalog range and an older transitive resolution" do
+      let(:files) { project_dependency_files("yarn_berry/catalog_multiversion") }
+
+      it "uses the catalog descriptor rather than the lowest locked version" do
+        dependency = parser.parse.find { |dep| dep.name == "is-number" }
+
+        expect(dependency).to have_attributes(version: "6.0.0")
+        expect(dependency.requirements.first.requirement).to eq("^5.0.0 || ^6.0.0")
+        expect(dependency.all_versions).to contain_exactly("4.0.0", "6.0.0")
+      end
+    end
+
+    context "when the catalog resolves to a local workspace" do
+      let(:files) { project_dependency_files("yarn_berry/catalog_transparent_workspace") }
+
+      it "does not turn the local workspace into a direct registry dependency" do
+        expect(parser.parse.select(&:top_level?).map(&:name)).not_to include("is-number")
+      end
+
+      context "with transparent workspaces disabled" do
+        before do
+          files.find { |file| file.name == ".yarnrc.yml" }.content += "enableTransparentWorkspaces: false\n"
+          lock = files.find { |file| file.name == "yarn.lock" }
+          lock.content = lock.content.sub(
+            '"is-number@npm:^4.0.0, is-number@workspace:packages/local":',
+            '"is-number@workspace:packages/local":'
+          ) + <<~YAML
+
+            "is-number@npm:^4.0.0":
+              version: 4.0.0
+              resolution: "is-number@npm:4.0.0"
+          YAML
+        end
+
+        it "keeps the registry catalog dependency even when a workspace has the same name" do
+          dependency = parser.parse.find { |dep| dep.name == "is-number" }
+          expect(dependency).to have_attributes(version: "4.0.0")
+          expect(dependency.requirements.first.metadata_string("yarn_catalog_reference")).to eq("catalog:")
+        end
+      end
+    end
+
+    context "with a named default catalog" do
+      before do
+        config = files.find { |file| file.name == ".yarnrc.yml" }
+        config.content = config.content.sub("unused:", "default:")
+        files.select { |file| file.name.end_with?("package.json") }.each do |file|
+          file.content = file.content.gsub('"catalog:"', '"catalog:default"')
+        end
+      end
+
+      it "does not confuse the named catalog with the unnamed catalog or accept a mismatching sole entry" do
+        expect { parser.parse }.to raise_error(Dependabot::DependencyFileNotResolvable, /prettier/)
+      end
+    end
+
+    context "with pnpm catalogs and a stale Yarn lockfile" do
+      let(:files) { project_dependency_files("pnpm/catalog_duplicate_versions") }
+
+      before do
+        files << Dependabot::DependencyFile.new(name: "yarn.lock", content: "# stale\n")
+        root = files.find { |file| file.name == "package.json" }
+        manifest = JSON.parse(root.content).merge("packageManager" => "pnpm@10.0.0")
+        root.content = JSON.generate(manifest)
+      end
+
+      it "keeps pnpm catalog requirements without trying to resolve Yarn configuration" do
+        dependency = parser.parse.find { |dep| dep.name == "globals" }
+        expect(dependency.requirements.map(&:file)).to include("pnpm-workspace.yaml")
+        expect(dependency.requirements.map(&:file)).not_to include(".yarnrc.yml")
+      end
+    end
+  end
+
   describe "lockfile lookup presence" do
     let(:locked_entries) { { "chalk" => {} } }
     let(:files) do

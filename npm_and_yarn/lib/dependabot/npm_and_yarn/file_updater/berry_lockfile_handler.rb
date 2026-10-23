@@ -3,6 +3,7 @@
 
 require "sorbet-runtime"
 require "yaml"
+require "json"
 
 require "dependabot/npm_and_yarn/file_updater"
 
@@ -33,6 +34,41 @@ module Dependabot
             key.to_s.split(", ").any? { |part| split_descriptor(part)[0] == dep_name } &&
               value["version"] == version
           end
+        end
+
+        sig { params(parsed: T::Hash[String, T.untyped], descriptor: String).returns(T.nilable(String)) }
+        def self.descriptor_version(parsed, descriptor)
+          entry = parsed.find { |key, _value| key.split(", ").include?(descriptor) }&.last
+          entry.is_a?(Hash) ? entry["version"] : nil
+        end
+
+        # Attach the final range to its pinned resolution, retaining other
+        # descriptors. Yarn's following install removes any unused exact key.
+        sig { params(path: String, exact: String, range: String).void }
+        def self.rebind_descriptor(path, exact, range)
+          return if exact == range
+
+          parsed = T.must(parse(path))
+          source = parsed.keys.find { |key| key.split(", ").include?(exact) }
+          raise DependencyFileNotResolvable, "#{exact}: pinned catalog descriptor missing" unless source
+
+          content = File.read(path)
+          parsed.keys.each do |key|
+            next if key == source || !key.split(", ").include?(range)
+
+            content = remove_descriptor(content, key, range)
+          end
+          descriptors = (source.split(", ") + [range]).uniq
+          content = content.sub(/^#{Regexp.escape(source.to_json)}:/, "#{descriptors.join(', ').to_json}:")
+          File.write(path, content)
+        end
+
+        sig { params(content: String, key: String, descriptor: String).returns(String) }
+        def self.remove_descriptor(content, key, descriptor)
+          remaining = key.split(", ") - [descriptor]
+          return content.sub(/^#{Regexp.escape(key.to_json)}:\n.*?(?=^\S|\z)/m, "") if remaining.empty?
+
+          content.sub(/^#{Regexp.escape(key.to_json)}:/, "#{remaining.join(', ').to_json}:")
         end
 
         # Rewrites a lockfile descriptor key from exact version to range.
