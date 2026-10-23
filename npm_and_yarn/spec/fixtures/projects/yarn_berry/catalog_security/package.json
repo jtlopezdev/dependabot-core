@@ -1,0 +1,11 @@
+{
+  "name": "catalog-security",
+  "private": true,
+  "packageManager": "yarn@4.10.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "is-odd": "catalog:math"
+  }
+}

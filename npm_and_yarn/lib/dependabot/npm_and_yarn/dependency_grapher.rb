@@ -262,7 +262,10 @@ module Dependabot
         when NpmPackageManager::NAME
           NpmRelationshipResolver.new(T.must(lockfiles_hash[:npm])).relationships
         when YarnPackageManager::NAME
-          YarnRelationshipResolver.new(T.must(lockfiles_hash[:yarn])).relationships
+          YarnRelationshipResolver.new(
+            T.must(lockfiles_hash[:yarn]),
+            catalogs: YarnCatalogs.new(dependency_files: dependency_files).helper_catalogs
+          ).relationships
         when PNPMPackageManager::NAME
           PnpmRelationshipResolver.new(T.must(lockfiles_hash[:pnpm])).relationships
         else

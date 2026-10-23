@@ -21,6 +21,7 @@ module Dependabot
         require_relative "npmrc_builder"
         require_relative "package_json_updater"
         require_relative "package_json_preparer"
+        require_relative "yarnrc_catalog_updater"
         require_relative "berry_lockfile_handler"
 
         extend T::Sig
@@ -110,14 +111,27 @@ module Dependabot
             write_temporary_dependency_files(yarn_lock)
             lockfile_name = Pathname.new(yarn_lock.name).basename.to_s
             path = Pathname.new(yarn_lock.name).dirname.to_s
-            updated_files = run_current_yarn_update(
-              path: path,
-              yarn_lock: yarn_lock
-            )
+            updated_files = run_current_yarn_update(path: path, yarn_lock: yarn_lock)
             updated_files.fetch(lockfile_name)
+          ensure
+            restore_catalog_inputs
           end
         rescue SharedHelpers::HelperSubprocessFailed => e
           handle_yarn_lock_updater_error(e, yarn_lock)
+        end
+
+        sig { void }
+        def restore_catalog_inputs
+          return unless dependencies.any? do |dependency|
+            dependency.requirements.any? { |requirement| requirement.metadata_string("yarn_catalog_reference") }
+          end
+
+          dependency_files.each do |file|
+            next if file.name.start_with?("../")
+
+            FileUtils.mkdir_p(File.dirname(file.name))
+            File.write(file.name, file.content)
+          end
         end
 
         sig do
@@ -149,6 +163,19 @@ module Dependabot
           ).returns(T::Hash[String, String])
         end
         def run_previous_yarn_update(path:, yarn_lock:)
+          if top_level_dependencies.any? do |dependency|
+            yarn_catalogs.bindings.any? do |binding|
+              binding.name == dependency.name
+            end
+          end
+            return SharedHelpers.with_git_configured(credentials: credentials) do
+              Dir.chdir(path) do
+                Helpers.run_yarn_command("install #{yarn_berry_args}".strip, env: yarn_time_gate_env)
+                { yarn_lock.name => File.read(yarn_lock.name) }
+              end
+            end
+          end
+
           previous_top_level_dependencies = top_level_dependencies.map do |d|
             {
               name: d.name,
@@ -226,6 +253,9 @@ module Dependabot
             .returns(T::Hash[String, String])
         end
         def run_yarn_berry_top_level_updater(top_level_dependency_updates:, yarn_lock:)
+          catalog_names = yarn_catalogs.bindings.map(&:name) & top_level_dependencies.map(&:name)
+          return run_yarn_catalog_updater(top_level_dependency_updates, yarn_lock, catalog_names) if catalog_names.any?
+
           write_temporary_dependency_files(yarn_lock)
           # If the requirements have changed, it means we've updated the
           # package.json file(s), and we can just run yarn install to get the
@@ -255,6 +285,67 @@ module Dependabot
           { yarn_lock.name => File.read(yarn_lock.name) }
         end
 
+        sig { returns(YarnCatalogs) }
+        def yarn_catalogs
+          @yarn_catalogs ||= T.let(YarnCatalogs.new(dependency_files: dependency_files), T.nilable(YarnCatalogs))
+        end
+
+        sig do
+          params(updates: T::Array[T::Hash[Symbol, T.untyped]], yarn_lock: DependencyFile, names: T::Array[String])
+            .returns(T::Hash[String, String])
+        end
+        def run_yarn_catalog_updater(updates, yarn_lock, names)
+          names.each { |name| yarn_catalogs.validate_update!(name) }
+          write_temporary_dependency_files(yarn_lock)
+          yarn_catalogs.validate_yarn_version!(Helpers.yarn_version)
+
+          pins = top_level_dependencies.select { |dependency| names.include?(dependency.name) }
+                                       .to_h { |dependency| [dependency.name, T.must(dependency.version)] }
+          editor = YarnrcCatalogUpdater.new(catalogs: yarn_catalogs, dependencies: dependencies)
+          install_catalog_targets(editor, pins, yarn_lock)
+          pin_berry_versions_if_needed(
+            updates.reject { |update| names.include?(update[:name]) }, yarn_lock, strict_descriptors: true
+          )
+          verify_catalog_targets(pins, yarn_lock)
+          { yarn_lock.name => File.read(yarn_lock.name) }
+        rescue StandardError
+          write_temporary_dependency_files(yarn_lock, update_package_json: false)
+          raise
+        end
+
+        sig { params(editor: YarnrcCatalogUpdater, pins: T::Hash[String, String], yarn_lock: DependencyFile).void }
+        def install_catalog_targets(editor, pins, yarn_lock)
+          File.write(".yarnrc.yml", sanitize_yarnrc_content(editor.updated_content(pins: pins)))
+          Helpers.run_yarn_command("install #{yarn_berry_args}".strip, env: yarn_time_gate_env)
+
+          catalog_descriptors(pins.keys).each do |name, descriptor|
+            BerryLockfileHandler.rebind_descriptor(yarn_lock.name, "#{name}@npm:#{pins.fetch(name)}", descriptor)
+          end
+          File.write(".yarnrc.yml", sanitize_yarnrc_content(editor.updated_content))
+          Helpers.run_yarn_command("install #{yarn_berry_args}".strip, env: yarn_time_gate_env)
+        end
+
+        sig { params(pins: T::Hash[String, String], yarn_lock: DependencyFile).void }
+        def verify_catalog_targets(pins, yarn_lock)
+          parsed = T.must(BerryLockfileHandler.parse(yarn_lock.name))
+          catalog_descriptors(pins.keys).each do |name, descriptor|
+            unless BerryLockfileHandler.descriptor_version(parsed, descriptor) == pins.fetch(name)
+              raise DependencyFileNotResolvable, "#{descriptor}: Yarn did not retain the selected catalog version"
+            end
+          end
+        end
+
+        sig { params(names: T::Array[String]).returns(T::Array[[String, String]]) }
+        def catalog_descriptors(names)
+          top_level_dependencies.select { |dependency| names.include?(dependency.name) }.flat_map do |dependency|
+            dependency.requirements.filter_map do |requirement|
+              next unless requirement.metadata_string("yarn_catalog_reference")
+
+              [dependency.name, "#{dependency.name}@npm:#{requirement.requirement_string}"]
+            end
+          end
+        end
+
         sig { params(dependency_name: String).returns(T::Boolean) }
         def requirements_changed?(dependency_name)
           dep = top_level_dependencies.find { |d| d.name == dependency_name }
@@ -270,26 +361,29 @@ module Dependabot
         sig do
           params(
             top_level_dependency_updates: T::Array[T::Hash[Symbol, T.untyped]],
-            yarn_lock: Dependabot::DependencyFile
+            yarn_lock: Dependabot::DependencyFile,
+            strict_descriptors: T::Boolean
           ).void
         end
-        def pin_berry_versions_if_needed(top_level_dependency_updates, yarn_lock)
+        def pin_berry_versions_if_needed(top_level_dependency_updates, yarn_lock, strict_descriptors: false)
           parsed = BerryLockfileHandler.parse(yarn_lock.name)
           return unless parsed
 
           top_level_dependency_updates.each do |dep|
-            pin_berry_version_if_needed(dep, yarn_lock, parsed)
+            pin_berry_version_if_needed(dep, yarn_lock, parsed, strict_descriptors: strict_descriptors)
           end
+          verify_companion_targets(top_level_dependency_updates, yarn_lock) if strict_descriptors
         end
 
         sig do
           params(
             dep: T::Hash[Symbol, T.untyped],
             yarn_lock: Dependabot::DependencyFile,
-            parsed_lockfile: T::Hash[String, T.untyped]
+            parsed_lockfile: T::Hash[String, T.untyped],
+            strict_descriptors: T::Boolean
           ).void
         end
-        def pin_berry_version_if_needed(dep, yarn_lock, parsed_lockfile)
+        def pin_berry_version_if_needed(dep, yarn_lock, parsed_lockfile, strict_descriptors: false)
           version = dep[:version]
           return unless version
 
@@ -297,8 +391,25 @@ module Dependabot
           reqs = T.cast(dep[:requirements], T.nilable(T::Array[Dependabot::DependencyRequirement]))
           return if reqs.nil? || reqs.empty?
           return if reqs.any? { |req| req.source_string("type") == "git" }
-          return if BerryLockfileHandler.version_matches?(parsed_lockfile, dep_name, T.cast(version, String))
+          return if berry_version_matches?(
+            parsed_lockfile, dep_name, T.cast(version, String), reqs, strict_descriptors: strict_descriptors
+          )
 
+          reinstall_berry_target(
+            dep_name, T.cast(version, String), reqs, yarn_lock, strict_descriptors: strict_descriptors
+          )
+        end
+
+        sig do
+          params(
+            dep_name: String,
+            version: String,
+            reqs: T::Array[DependencyRequirement],
+            yarn_lock: DependencyFile,
+            strict_descriptors: T::Boolean
+          ).void
+        end
+        def reinstall_berry_target(dep_name, version, reqs, yarn_lock, strict_descriptors:)
           saved_package_jsons = save_package_jsons
 
           Helpers.run_yarn_command(
@@ -311,13 +422,54 @@ module Dependabot
             requirement = req.requirement_string
             next unless requirement
 
-            BerryLockfileHandler.replace_declaration(yarn_lock.name, dep_name, T.cast(version, String), requirement)
+            if strict_descriptors
+              BerryLockfileHandler.rebind_descriptor(
+                yarn_lock.name, "#{dep_name}@npm:#{version}", "#{dep_name}@npm:#{requirement}"
+              )
+            else
+              BerryLockfileHandler.replace_declaration(yarn_lock.name, dep_name, version, requirement)
+            end
           end
 
           # Restore package.json and re-install to normalize lockfile descriptors,
           # same as yarn classic's replaceLockfileDeclaration flow.
           restore_package_jsons(saved_package_jsons)
           Helpers.run_yarn_command("install #{yarn_berry_args}".strip, env: yarn_time_gate_env)
+        ensure
+          restore_package_jsons(saved_package_jsons) if saved_package_jsons
+        end
+
+        sig { params(updates: T::Array[T::Hash[Symbol, T.untyped]], yarn_lock: DependencyFile).void }
+        def verify_companion_targets(updates, yarn_lock)
+          parsed = T.must(BerryLockfileHandler.parse(yarn_lock.name))
+          updates.each do |update|
+            reqs = T.cast(update[:requirements], T::Array[DependencyRequirement])
+            next if reqs.any? { |req| req.source_string("type") == "git" }
+
+            name = T.cast(update[:name], String)
+            version = T.cast(update[:version], String)
+            next if berry_version_matches?(parsed, name, version, reqs, strict_descriptors: true)
+
+            raise DependencyFileNotResolvable, "#{name}: Yarn did not retain the selected companion version"
+          end
+        end
+
+        sig do
+          params(
+            parsed: T::Hash[String, T.untyped],
+            name: String,
+            version: String,
+            requirements: T::Array[DependencyRequirement],
+            strict_descriptors: T::Boolean
+          ).returns(T::Boolean)
+        end
+        def berry_version_matches?(parsed, name, version, requirements, strict_descriptors:)
+          return BerryLockfileHandler.version_matches?(parsed, name, version) unless strict_descriptors
+
+          requirements.all? do |requirement|
+            descriptor = "#{name}@npm:#{requirement.requirement_string}"
+            BerryLockfileHandler.descriptor_version(parsed, descriptor) == version
+          end
         end
 
         sig { returns(T::Hash[String, String]) }
@@ -588,7 +740,11 @@ module Dependabot
               SharedHelpers.in_a_temporary_repo_directory(base_dir, repo_contents_path) do
                 write_temporary_dependency_files(yarn_lock, update_package_json: false)
                 path = Pathname.new(yarn_lock.name).dirname.to_s
-                run_previous_yarn_update(path: path, yarn_lock: yarn_lock)
+                begin
+                  run_previous_yarn_update(path: path, yarn_lock: yarn_lock)
+                ensure
+                  restore_catalog_inputs
+                end
               end
 
               true
@@ -619,7 +775,8 @@ module Dependabot
 
           if Helpers.yarn_berry?(yarn_lock)
             if yarnrc_yml_file
-              yarnrc_yml_sanitize_content = sanitize_yarnrc_content(yarnrc_yml_content)
+              content = temporary_yarnrc_content(update_package_json)
+              yarnrc_yml_sanitize_content = sanitize_yarnrc_content(content)
               File.write(".yarnrc.yml", yarnrc_yml_sanitize_content)
             end
           elsif yarnrc_specifies_private_reg?
@@ -643,6 +800,13 @@ module Dependabot
           end
 
           clean_npmrc_in_path(yarn_lock)
+        end
+
+        sig { params(update: T::Boolean).returns(String) }
+        def temporary_yarnrc_content(update)
+          return yarnrc_yml_content unless update && yarn_catalogs.bindings.any?
+
+          YarnrcCatalogUpdater.new(catalogs: yarn_catalogs, dependencies: dependencies).updated_content
         end
 
         sig { params(content: String).returns(String) }

@@ -27,6 +27,13 @@ module Dependabot
 
       sig { returns(T::Array[Dependabot::DependencyFile]) }
       def files_requiring_update
+        # A catalog edit affects every consumer in the Yarn project. Installation
+        # needs its complete workspace topology even though the editable range is
+        # in the configuration rather than in any package.json.
+        return dependency_files if updated_dependencies.any? do |dependency|
+          dependency.requirements.any? { |requirement| requirement.metadata_string("yarn_catalog_reference") }
+        end
+
         @files_requiring_update ||= T.let(
           dependency_files.select do |file|
             package_files_requiring_update.include?(file) ||

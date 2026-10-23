@@ -1,0 +1,14 @@
+{
+  "name": "catalog-investigation",
+  "private": true,
+  "packageManager": "yarn@4.10.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "is-number": "catalog:"
+  },
+  "devDependencies": {
+    "prettier": "catalog:format"
+  }
+}
