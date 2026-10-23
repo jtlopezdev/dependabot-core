@@ -199,7 +199,7 @@ RSpec.describe Dependabot::NpmAndYarn::YarnCatalogs do
 
     it "keeps residual lockfile inventory from entering a registry update check" do
       dependency = Dependabot::NpmAndYarn::FileParser.new(dependency_files: files, source: nil).parse
-                                                   .find { |dep| dep.name == "is-number" }
+                                                     .find { |dep| dep.name == "is-number" }
       expect(dependency).not_to be_top_level
       expect do
         Dependabot::NpmAndYarn::UpdateChecker.new(dependency: dependency, dependency_files: files, credentials: [])

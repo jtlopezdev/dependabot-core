@@ -16,7 +16,7 @@ direct declaration, reports an unsupported feature. Catalog ranges resolved to l
 registry updates. Inherited configuration, plugin catalogs, and selected YAML aliases or anchors are also outside this scope.
 
 Catalog edges participate in dependency graph and conflict traversal. Security updates for catalog dependencies
-and transitive dependencies below catalogs are not yet supported. Unrelated ordinary security updates remain available.
+and transitive updates in projects using catalogs are not yet supported. Ordinary direct security updates remain available.
 
 ### Running locally
 
