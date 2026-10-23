@@ -8,6 +8,8 @@ require "dependabot/updater/dependency_group_change_batch"
 require "dependabot/updater/semver_grouping_rules"
 require "dependabot/workspace"
 require "dependabot/updater/security_update_helpers"
+require "dependabot/updater/yarn_catalog_update_checker_options"
+require "dependabot/updater/yarn_catalog_security_update_helpers"
 require "dependabot/service"
 require "dependabot/notices"
 require "dependabot/update_checkers/base"
@@ -31,6 +33,7 @@ module Dependabot
       extend T::Helpers
       include PullRequestHelpers
       include SecurityUpdateHelpers
+      include YarnCatalogSecurityUpdateHelpers
 
       abstract!
 
@@ -91,9 +94,11 @@ module Dependabot
         group_changes = Dependabot::Updater::DependencyGroupChangeBatch.new(
           initial_dependency_files: dependency_files
         )
+        initial_files = dependency_files
 
         # deduplicate the dependencies.
         original_dependencies = dependency_snapshot.dependencies
+        checked_dependencies = T.let([], T::Array[Dependabot::Dependency])
 
         # log the original dependencies and job specified dependencies.
         Dependabot.logger.info("Dependency Snapshot: #{original_dependencies.map(&:name).join(', ')}")
@@ -113,19 +118,21 @@ module Dependabot
 
           # Reparse the current files
           reparsed_dependencies = dependency_file_parser(dependency_files).parse
+          original_dependency = original_dependencies.find { |d| d.name == dependency.name }
+          checked_dependencies << original_dependency if original_dependency
           dependency = reparsed_dependencies.find { |d| d.name == dependency.name }
 
           # If the dependency can not be found in the reparsed files then it was likely removed by a previous
           # dependency update
-          next if dependency.nil?
-
           # If the dependency version changed, then we can deduce that the dependency was updated already.
-          original_dependency = original_dependencies.find { |d| d.name == dependency.name }
-          updated_dependency = deduce_updated_dependency(dependency, original_dependency)
+          updated_dependency = deduce_catalog_security_update(
+            dependency, original_dependency, dependency_files, initial_files, group
+          )
           unless updated_dependency.nil?
             group_changes.add_updated_dependency(updated_dependency)
             next
           end
+          next unless dependency
 
           updated_dependencies = compile_updates_for(dependency, dependency_files, group)
           if original_dependency &&
@@ -136,9 +143,7 @@ module Dependabot
           end
           next unless updated_dependencies.any?
 
-          lead_dependency = updated_dependencies.find do |dep|
-            dep.name.casecmp(dependency.name)&.zero?
-          end
+          lead_dependency = updated_dependencies.find { |dep| dep.name.casecmp(dependency.name)&.zero? }
 
           next unless lead_dependency
 
@@ -154,11 +159,15 @@ module Dependabot
             next
           end
 
+          verify_catalog_change!(dependency_change, original_dependency, dependency_files, initial_files, group)
+
           # Store the updated files for the next loop
           group_changes.merge(dependency_change)
           store_changes(dependency)
         end
 
+        reconcile_catalog_security_updates!(group_changes, checked_dependencies, initial_files, group)
+        finalize_group_catalog_security!(group_changes, initial_files, group)
         group_notices = notices + group_changes.notices
         add_cooldown_date_unavailable_notice(group_notices, original_dependencies)
 
@@ -555,7 +564,14 @@ module Dependabot
           requirements_update_strategy: job.requirements_update_strategy,
           dependency_group: dependency_group,
           update_cooldown: job.security_updates_only? ? nil : job.cooldown,
-          options: job.experiments
+          options: if job.security_updates_only?
+                     YarnCatalogUpdateCheckerOptions.for(
+                       job: job,
+                       dependency_files: dependency_files
+                     )
+                   else
+                     job.experiments
+                   end
         )
       end
 
@@ -762,13 +778,14 @@ module Dependabot
       sig do
         params(
           dependency: T.nilable(Dependabot::Dependency),
-          original_dependency: T.nilable(Dependabot::Dependency)
+          original_dependency: T.nilable(Dependabot::Dependency),
+          inventory_changed: T::Boolean
         )
           .returns(T.nilable(Dependabot::Dependency))
       end
-      def deduce_updated_dependency(dependency, original_dependency)
+      def deduce_updated_dependency(dependency, original_dependency, inventory_changed: false)
         return nil if dependency.nil? || original_dependency.nil?
-        return nil if original_dependency.version == dependency.version
+        return nil if original_dependency.version == dependency.version && !inventory_changed
 
         Dependabot.logger.info(
           "Skipping #{dependency.name} as it has already been updated to #{dependency.version}"
@@ -781,7 +798,8 @@ module Dependabot
           previous_version: original_dependency.version,
           requirements: dependency.requirements,
           previous_requirements: original_dependency.requirements,
-          package_manager: dependency.package_manager
+          package_manager: dependency.package_manager,
+          metadata: dependency.metadata
         }
 
         Dependabot::Dependency.new(**dependency_params)

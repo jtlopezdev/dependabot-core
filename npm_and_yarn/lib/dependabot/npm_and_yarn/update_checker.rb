@@ -24,6 +24,7 @@ module Dependabot
       require_relative "update_checker/subdependency_version_resolver"
       require_relative "update_checker/conflicting_dependency_resolver"
       require_relative "update_checker/vulnerability_auditor"
+      require_relative "update_checker/yarn_catalog_security_updater"
 
       sig do
         params(
@@ -69,15 +70,11 @@ module Dependabot
         @library = T.let(nil, T.nilable(T::Boolean))
         @package_json = T.let(nil, T.nilable(Dependabot::DependencyFile))
         @git_commit_checker = T.let(nil, T.nilable(Dependabot::GitCommitChecker))
+        @verified_catalog_security_updates = T.let(
+          {}, T::Hash[T.nilable(Symbol), T.nilable(T::Array[Dependency])]
+        )
         super
-        catalogs = YarnCatalogs.new(dependency_files: dependency_files)
-        catalogs.validate_update!(dependency.name)
-        if security_advisories.any? && catalogs.bindings.any? &&
-           (!dependency.top_level? || catalogs.bindings.any? { |binding| binding.name == dependency.name })
-          raise ToolFeatureNotSupported.new(
-            tool_name: "yarn", tool_type: "package_manager", feature: "security updates for Yarn catalogs"
-          )
-        end
+        YarnCatalogs.new(dependency_files: dependency_files).validate_update!(dependency.name)
         Helpers.dependency_files = dependency_files
         Helpers.credentials = credentials
         Helpers.activate_npm_version_selector(dependency_files)
@@ -101,6 +98,22 @@ module Dependabot
       sig { returns(T::Boolean) }
       def vulnerable?
         super || vulnerable_versions.any?
+      end
+
+      sig { override.params(requirements_to_unlock: T.nilable(Symbol)).returns(T::Boolean) }
+      def can_update?(requirements_to_unlock:)
+        return false unless super
+        return true unless catalog_security_preview_required?(requirements_to_unlock)
+
+        verified_catalog_security_updates(requirements_to_unlock)&.any? || false
+      end
+
+      sig { override.params(requirements_to_unlock: T.nilable(Symbol)).returns(T::Array[Dependency]) }
+      def updated_dependencies(requirements_to_unlock:)
+        return super unless catalog_security_preview_required?(requirements_to_unlock)
+        return [] unless can_update?(requirements_to_unlock: requirements_to_unlock)
+
+        T.must(verified_catalog_security_updates(requirements_to_unlock))
       end
 
       sig { override.returns(T.nilable(T.any(String, Gem::Version))) }
@@ -157,9 +170,14 @@ module Dependabot
         # security fix version that does not require unlocking other dependencies.
         return latest_resolvable_transitive_security_fix_version_with_no_unlock unless dependency.top_level?
 
-        # For top-level dependencies, return the lowest security fix version.
-        # TODO: Consider checking resolvability here in the future.
-        lowest_security_fix_version
+        # Catalog security fixes also need to satisfy peer requirements.
+        version = lowest_security_fix_version
+        catalog_dependency = dependency.requirements.any? do |requirement|
+          requirement.metadata_string("yarn_catalog_reference")
+        end
+        return nil if version && catalog_dependency && !version_resolver.catalog_version_resolvable?(version)
+
+        version
       end
 
       sig { override.returns(T.nilable(T.any(String, Dependabot::Version))) }
@@ -301,6 +319,8 @@ module Dependabot
       def latest_version_resolvable_with_full_unlock?
         return false unless latest_version
 
+        return yarn_catalog_security_updater.updates&.any? || false if transitive_catalog_security_update?
+
         return version_resolver.latest_version_resolvable_with_full_unlock? if dependency.top_level?
 
         return false unless security_advisories.any?
@@ -310,10 +330,64 @@ module Dependabot
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def updated_dependencies_after_full_unlock
+        return T.must(yarn_catalog_security_updater.updates) if transitive_catalog_security_update?
+
         return conflicting_updated_dependencies if security_advisories.any? && vulnerability_audit.fix_available
 
         T.must(version_resolver.dependency_updates_from_full_unlock)
          .map { |update_details| build_updated_dependency(update_details.transform_keys(&:to_sym)) }
+      end
+
+      sig { returns(T::Boolean) }
+      def transitive_catalog_security_update?
+        !dependency.top_level? && security_advisories.any? &&
+          dependency_files.any? { |file| file.name == "yarn.lock" } &&
+          YarnCatalogs.new(dependency_files: dependency_files).bindings.any?
+      end
+
+      sig { returns(T::Boolean) }
+      def direct_catalog_security_update?
+        security_advisories.any? && dependency.requirements.any? do |requirement|
+          requirement.metadata_string("yarn_catalog_reference")
+        end
+      end
+
+      sig { params(unlock: T.nilable(Symbol)).returns(T::Boolean) }
+      def catalog_security_preview_required?(unlock)
+        direct_catalog_security_update? || (unlock != :all && transitive_catalog_security_update?)
+      end
+
+      sig { params(unlock: T.nilable(Symbol)).returns(T.nilable(T::Array[Dependency])) }
+      def verified_catalog_security_updates(unlock)
+        return @verified_catalog_security_updates[unlock] if @verified_catalog_security_updates.key?(unlock)
+
+        candidates = case unlock
+                     when :none then [updated_dependency_without_unlock]
+                     when :own then [updated_dependency_with_own_req_unlock]
+                     when :all
+                       version_resolver.dependency_updates_from_full_unlock&.map do |details|
+                         build_updated_dependency(details.transform_keys(&:to_sym))
+                       end
+                     else raise "Unknown unlock level '#{unlock}'"
+                     end
+        @verified_catalog_security_updates[unlock] = if candidates&.any?
+                                                       yarn_catalog_security_updater.verify_updates(candidates)
+                                                     end
+      end
+
+      sig { returns(YarnCatalogSecurityUpdater) }
+      def yarn_catalog_security_updater
+        @yarn_catalog_security_updater ||= T.let(
+          YarnCatalogSecurityUpdater.new(
+            dependency: dependency,
+            dependency_files: dependency_files,
+            credentials: credentials,
+            security_advisories: security_advisories,
+            latest_version_finder: latest_version_finder,
+            ancestor_checker: T.cast(options[:yarn_catalog_ancestor_checker], T.nilable(YarnCatalogSecurityUpdater::CheckerFactory))
+          ),
+          T.nilable(YarnCatalogSecurityUpdater)
+        )
       end
 
       # rubocop:disable Metrics/AbcSize

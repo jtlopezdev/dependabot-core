@@ -7,6 +7,7 @@ require "dependabot/dependency"
 require "support/dummy_package_manager/dummy"
 
 require "dependabot/bundler"
+require "dependabot/npm_and_yarn"
 
 RSpec.describe Dependabot::Job do
   subject(:job) { described_class.new(attributes) }
@@ -963,6 +964,67 @@ RSpec.describe Dependabot::Job do
         end
 
         it "returns false" do
+          expect(previous_version_vulnerable).to be(false)
+        end
+      end
+    end
+
+    context "with a verified Yarn catalog security inventory" do
+      let(:package_manager) { "npm_and_yarn" }
+      let(:security_advisories) do
+        [{ "dependency-name" => "is-number", "affected-versions" => [">= 4.0.0 < 6.0.0"] }]
+      end
+      let(:metadata) do
+        {
+          yarn_catalog_security_contracts: [{
+            "target" => "is-number", "versions" => %w(2.1.0 6.0.0),
+            "retained_versions" => ["2.1.0"], "retained_edges" => []
+          }],
+          yarn_catalog_security_previous_versions: %w(2.1.0 4.0.0)
+        }
+      end
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: "is-number",
+          package_manager: package_manager,
+          version: "2.1.0",
+          previous_version: "2.1.0",
+          requirements: [],
+          metadata: metadata
+        )
+      end
+
+      it "checks the vulnerable original branch even when the representative stays safe" do
+        expect(previous_version_vulnerable).to be(true)
+      end
+
+      it "does not infer previous vulnerability from inventory metadata without a verified contract" do
+        metadata.delete(:yarn_catalog_security_contracts)
+        expect(previous_version_vulnerable).to be(false)
+      end
+
+      it "does not use current installed versions as the previous inventory" do
+        metadata.delete(:yarn_catalog_security_previous_versions)
+        metadata[:all_versions] = [
+          Dependabot::Dependency.new(
+            name: "is-number", package_manager: package_manager, version: "4.0.0", requirements: []
+          )
+        ]
+        expect(previous_version_vulnerable).to be(false)
+      end
+
+      it "does not treat an entirely safe original inventory as vulnerable" do
+        metadata[:yarn_catalog_security_previous_versions] = %w(2.1.0 6.0.0)
+        expect(previous_version_vulnerable).to be(false)
+      end
+
+      context "with another package manager" do
+        let(:package_manager) { "bundler" }
+        let(:security_advisories) do
+          [{ "dependency-name" => "is-number", "affected-versions" => ["= 4.0.0"] }]
+        end
+
+        it "preserves the existing previous representative check" do
           expect(previous_version_vulnerable).to be(false)
         end
       end
