@@ -8,6 +8,8 @@ require "dependabot/updater/dependency_group_change_batch"
 require "dependabot/updater/semver_grouping_rules"
 require "dependabot/workspace"
 require "dependabot/updater/security_update_helpers"
+require "dependabot/updater/yarn_catalog_update_checker_options"
+require "dependabot/npm_and_yarn/yarn_catalog_security_validation"
 require "dependabot/service"
 require "dependabot/notices"
 require "dependabot/update_checkers/base"
@@ -91,9 +93,11 @@ module Dependabot
         group_changes = Dependabot::Updater::DependencyGroupChangeBatch.new(
           initial_dependency_files: dependency_files
         )
+        initial_files = dependency_files
 
         # deduplicate the dependencies.
         original_dependencies = dependency_snapshot.dependencies
+        checked_dependencies = T.let([], T::Array[Dependabot::Dependency])
 
         # log the original dependencies and job specified dependencies.
         Dependabot.logger.info("Dependency Snapshot: #{original_dependencies.map(&:name).join(', ')}")
@@ -113,19 +117,21 @@ module Dependabot
 
           # Reparse the current files
           reparsed_dependencies = dependency_file_parser(dependency_files).parse
+          original_dependency = original_dependencies.find { |d| d.name == dependency.name }
+          checked_dependencies << original_dependency if original_dependency
           dependency = reparsed_dependencies.find { |d| d.name == dependency.name }
 
           # If the dependency can not be found in the reparsed files then it was likely removed by a previous
           # dependency update
-          next if dependency.nil?
-
           # If the dependency version changed, then we can deduce that the dependency was updated already.
-          original_dependency = original_dependencies.find { |d| d.name == dependency.name }
-          updated_dependency = deduce_updated_dependency(dependency, original_dependency)
+          updated_dependency = deduce_catalog_security_update(
+            dependency, original_dependency, dependency_files, initial_files, group
+          )
           unless updated_dependency.nil?
             group_changes.add_updated_dependency(updated_dependency)
             next
           end
+          next unless dependency
 
           updated_dependencies = compile_updates_for(dependency, dependency_files, group)
           if original_dependency &&
@@ -136,9 +142,7 @@ module Dependabot
           end
           next unless updated_dependencies.any?
 
-          lead_dependency = updated_dependencies.find do |dep|
-            dep.name.casecmp(dependency.name)&.zero?
-          end
+          lead_dependency = updated_dependencies.find { |dep| dep.name.casecmp(dependency.name)&.zero? }
 
           next unless lead_dependency
 
@@ -154,11 +158,15 @@ module Dependabot
             next
           end
 
+          verify_catalog_change!(dependency_change, original_dependency, dependency_files, initial_files, group)
+
           # Store the updated files for the next loop
           group_changes.merge(dependency_change)
           store_changes(dependency)
         end
 
+        reconcile_catalog_security_updates!(group_changes, checked_dependencies, initial_files, group)
+        finalize_group_catalog_security!(group_changes, initial_files, group)
         group_notices = notices + group_changes.notices
         add_cooldown_date_unavailable_notice(group_notices, original_dependencies)
 
@@ -185,6 +193,233 @@ module Dependabot
       ensure
         cleanup_created_workspace_files(workspace_files) if workspace_files
         cleanup_workspace
+      end
+
+      sig do
+        params(
+          changes: Dependabot::Updater::DependencyGroupChangeBatch,
+          checked_dependencies: T::Array[Dependabot::Dependency],
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).void
+      end
+      def reconcile_catalog_security_updates!(changes, checked_dependencies, initial_files, group)
+        return unless job.package_manager == "npm_and_yarn" && job.security_updates_only?
+        return if changes.updated_dependency_files.empty?
+        return if Dependabot::NpmAndYarn::YarnCatalogs.new(dependency_files: initial_files).bindings.empty?
+
+        files = changes.current_dependency_files(job)
+        final_dependencies = dependency_file_parser(files).parse.to_h { |dependency| [dependency.name, dependency] }
+        reported = changes.updated_dependencies.map(&:name)
+        # A target checked before its blocking ancestor may have failed on its
+        # own. Reconsider only members visited in this directory and group;
+        # their handled state has already changed during the main loop.
+        checked_dependencies.uniq(&:name).each do |original|
+          next if reported.include?(original.name) || job.security_advisories_for(original).empty?
+
+          checker = update_checker_for(original, initial_files, group, raise_on_ignored: raise_on_ignored?(original))
+          next unless checker.vulnerable?
+
+          updated = deduce_catalog_security_update(
+            final_dependencies[original.name], original, files, initial_files, group
+          )
+          next unless updated
+
+          updated.metadata[:information_only] = true
+          changes.add_updated_dependency(updated)
+        end
+      end
+
+      sig do
+        params(
+          changes: Dependabot::Updater::DependencyGroupChangeBatch,
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).void
+      end
+      def finalize_group_catalog_security!(changes, initial_files, group)
+        return unless job.package_manager == "npm_and_yarn"
+
+        validation = Dependabot::NpmAndYarn::YarnCatalogSecurityValidation
+        targets = changes.updated_dependencies.flat_map do |dependency|
+          validation.contracts_for(dependency).map(&:target)
+        end
+        return if targets.empty?
+
+        files = changes.current_dependency_files(job)
+        # Later group members may legitimately change an earlier target's safe
+        # inventory. Reverify against the initial policy and edges, rather than
+        # requiring every intermediate resolution snapshot to remain identical.
+        contracts = targets.uniq.to_h do |name|
+          original = T.must(dependency_snapshot.dependencies.find { |dependency| dependency.name == name })
+          contract = original_catalog_security_contract!(
+            original, current_files: files, initial_files: initial_files, group: group
+          )
+          [name, contract]
+        end
+        final_dependencies = dependency_file_parser(files).parse.to_h { |dependency| [dependency.name, dependency] }
+        changes.updated_dependencies.map! do |dependency|
+          previous_contracts = validation.contracts_for(dependency)
+          if previous_contracts.any?
+            dependency.metadata[:yarn_catalog_security_contracts] =
+              previous_contracts.map do |contract|
+                T.cast(contracts.fetch(contract.target).serialize, T::Hash[String, Object])
+              end.uniq
+          end
+          next dependency unless contracts.key?(dependency.name)
+
+          catalog_dependency_with_final_inventory(dependency, final_dependencies[dependency.name])
+        end
+      end
+
+      sig do
+        params(dependency: Dependabot::Dependency, final: T.nilable(Dependabot::Dependency))
+          .returns(Dependabot::Dependency)
+      end
+      def catalog_dependency_with_final_inventory(dependency, final)
+        metadata = dependency.metadata.dup
+        metadata.delete(:all_versions)
+        inventory = final&.metadata&.fetch(:all_versions, nil)
+        metadata[:all_versions] = inventory if inventory
+        Dependabot::Dependency.new(
+          name: dependency.name,
+          version: final&.version,
+          previous_version: dependency.previous_version,
+          package_manager: dependency.package_manager,
+          requirements: final ? dependency.requirements : [],
+          previous_requirements: dependency.previous_requirements,
+          directory: dependency.directory,
+          subdependency_metadata: dependency.subdependency_metadata,
+          removed: final.nil?,
+          metadata: metadata
+        )
+      end
+
+      sig do
+        params(
+          dependency: T.nilable(Dependabot::Dependency),
+          original: T.nilable(Dependabot::Dependency),
+          files: T::Array[Dependabot::DependencyFile],
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).returns(T.nilable(Dependabot::Dependency))
+      end
+      def deduce_catalog_security_update(dependency, original, files, initial_files, group)
+        return deduce_removed_catalog_security_update(original, files, initial_files, group) unless dependency
+        return deduce_updated_dependency(dependency, original) unless original
+
+        changed = original.version != dependency.version || original.all_versions.sort != dependency.all_versions.sort
+        unless changed && catalog_security_target?(original, initial_files)
+          return deduce_updated_dependency(dependency, original)
+        end
+
+        current_checker = update_checker_for(dependency, files, group, raise_on_ignored: raise_on_ignored?(dependency))
+        return if current_checker.vulnerable?
+
+        contract = original_catalog_security_contract!(
+          original,
+          current_files: files,
+          initial_files: initial_files,
+          group: group
+        )
+
+        updated = T.must(deduce_updated_dependency(dependency, original, inventory_changed: true))
+        updated.metadata[:information_only] = true if original.version == dependency.version
+        updated.metadata[:yarn_catalog_security_previous_versions] = original.all_versions.compact
+        Dependabot::NpmAndYarn::YarnCatalogSecurityValidation.add_contract!(updated, contract)
+        updated
+      end
+
+      sig do
+        params(dependency: Dependabot::Dependency, files: T::Array[Dependabot::DependencyFile]).returns(T::Boolean)
+      end
+      def catalog_security_target?(dependency, files)
+        job.package_manager == "npm_and_yarn" && job.security_updates_only? &&
+          job.security_advisories_for(dependency).any? &&
+          Dependabot::NpmAndYarn::YarnCatalogs.new(dependency_files: files).bindings.any?
+      end
+
+      sig do
+        params(
+          original: T.nilable(Dependabot::Dependency),
+          files: T::Array[Dependabot::DependencyFile],
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).returns(T.nilable(Dependabot::Dependency))
+      end
+      def deduce_removed_catalog_security_update(original, files, initial_files, group)
+        return unless original && catalog_security_target?(original, initial_files)
+
+        checker = update_checker_for(original, initial_files, group, raise_on_ignored: raise_on_ignored?(original))
+        return unless checker.vulnerable?
+
+        contract = original_catalog_security_contract!(
+          original,
+          current_files: files,
+          initial_files: initial_files,
+          group: group
+        )
+        removed = Dependabot::Dependency.new(
+          name: original.name,
+          previous_version: original.version,
+          package_manager: original.package_manager,
+          requirements: [],
+          previous_requirements: original.requirements,
+          removed: true,
+          metadata: { information_only: true, yarn_catalog_security_previous_versions: original.all_versions.compact }
+        )
+        Dependabot::NpmAndYarn::YarnCatalogSecurityValidation.add_contract!(removed, contract)
+        removed
+      end
+
+      sig do
+        params(
+          change: Dependabot::DependencyChange,
+          original: T.nilable(Dependabot::Dependency),
+          current_files: T::Array[Dependabot::DependencyFile],
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).void
+      end
+      def verify_catalog_change!(change, original, current_files, initial_files, group)
+        return unless original && catalog_security_target?(original, initial_files)
+
+        files = current_files.map do |file|
+          change.updated_dependency_files.find { |updated| updated.path == file.path } || file
+        end
+        # A partial incidental fix must not reset the policy baseline and
+        # grandfather versions or edges introduced earlier in this group.
+        contract = original_catalog_security_contract!(
+          original,
+          current_files: files,
+          initial_files: initial_files,
+          group: group
+        )
+        change.updated_dependencies.each do |updated|
+          if updated.name == original.name
+            updated.metadata[:yarn_catalog_security_previous_versions] = original.all_versions.compact
+          end
+          Dependabot::NpmAndYarn::YarnCatalogSecurityValidation.add_contract!(updated, contract)
+        end
+      end
+
+      sig do
+        params(
+          original: Dependabot::Dependency,
+          current_files: T::Array[Dependabot::DependencyFile],
+          initial_files: T::Array[Dependabot::DependencyFile],
+          group: Dependabot::DependencyGroup
+        ).returns(Dependabot::NpmAndYarn::YarnCatalogSecurityValidation::Contract)
+      end
+      def original_catalog_security_contract!(original, current_files:, initial_files:, group:)
+        checker = update_checker_for(original, initial_files, group, raise_on_ignored: raise_on_ignored?(original))
+        contract = Dependabot::NpmAndYarn::UpdateChecker::YarnCatalogSecurityUpdater
+                   .for_resolution_check(checker: checker).verified_resolution_contract(current_files)
+        unless contract
+          Kernel.raise Dependabot::DependencyFileNotResolvable,
+                       "#{original.name}: catalog security update violates original target policy"
+        end
+        contract
       end
 
       sig { params(group: Dependabot::DependencyGroup).returns(T.nilable(Dependabot::DependencyChange)) }
@@ -555,7 +790,14 @@ module Dependabot
           requirements_update_strategy: job.requirements_update_strategy,
           dependency_group: dependency_group,
           update_cooldown: job.security_updates_only? ? nil : job.cooldown,
-          options: job.experiments
+          options: if job.security_updates_only?
+                     YarnCatalogUpdateCheckerOptions.for(
+                       job: job,
+                       dependency_files: dependency_files
+                     )
+                   else
+                     job.experiments
+                   end
         )
       end
 
@@ -762,13 +1004,14 @@ module Dependabot
       sig do
         params(
           dependency: T.nilable(Dependabot::Dependency),
-          original_dependency: T.nilable(Dependabot::Dependency)
+          original_dependency: T.nilable(Dependabot::Dependency),
+          inventory_changed: T::Boolean
         )
           .returns(T.nilable(Dependabot::Dependency))
       end
-      def deduce_updated_dependency(dependency, original_dependency)
+      def deduce_updated_dependency(dependency, original_dependency, inventory_changed: false)
         return nil if dependency.nil? || original_dependency.nil?
-        return nil if original_dependency.version == dependency.version
+        return nil if original_dependency.version == dependency.version && !inventory_changed
 
         Dependabot.logger.info(
           "Skipping #{dependency.name} as it has already been updated to #{dependency.version}"
@@ -781,7 +1024,8 @@ module Dependabot
           previous_version: original_dependency.version,
           requirements: dependency.requirements,
           previous_requirements: original_dependency.requirements,
-          package_manager: dependency.package_manager
+          package_manager: dependency.package_manager,
+          metadata: dependency.metadata
         }
 
         Dependabot::Dependency.new(**dependency_params)

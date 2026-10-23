@@ -47,6 +47,11 @@ module Dependabot
           end
         end
 
+        sig { void }
+        def restore_temporary_dependency_files
+          write_dependency_files(dependency_files) { |file| T.must(file.content) }
+        end
+
         sig { returns(T::Array[Dependabot::DependencyFile]) }
         def package_locks
           @package_locks ||= T.let(

@@ -63,4 +63,32 @@ RSpec.describe Dependabot::NpmAndYarn::DependencyGrapher::YarnRelationshipResolv
       expect(relationships).to be_empty
     end
   end
+
+  context "with catalog edges" do
+    let(:result) do
+      {
+        "workspace@workspace:packages/app" => {
+          "version" => "0.0.0-use.local", "dependencies" => { "@scope/pkg" => "catalog:default" }
+        },
+        "@scope/pkg@npm:^2.0.0, @scope/pkg@npm:~2.1.0" => { "version" => "2.1.0" },
+        "@scope/pkg@npm:^1.0.0" => { "version" => "1.9.0" }
+      }
+    end
+
+    it "resolves the exact effective descriptor instead of another version of the same package" do
+      resolver = described_class.new(lockfile, catalogs: { "catalog:default" => { "@scope/pkg" => "^2.0.0" } })
+      expect(resolver.relationships).to eq("workspace@0.0.0-use.local" => ["@scope/pkg@2.1.0"])
+    end
+
+    it "reports missing catalog mappings instead of silently dropping the edge" do
+      expect { relationships }.to raise_error(Dependabot::DependencyFileNotResolvable, /catalog:default/)
+    end
+
+    it "includes optional catalog edges in the graph" do
+      result["workspace@workspace:packages/app"]["optionalDependencies"] =
+        result["workspace@workspace:packages/app"].delete("dependencies")
+      resolver = described_class.new(lockfile, catalogs: { "catalog:default" => { "@scope/pkg" => "^2.0.0" } })
+      expect(resolver.relationships).to eq("workspace@0.0.0-use.local" => ["@scope/pkg@2.1.0"])
+    end
+  end
 end

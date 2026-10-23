@@ -37,21 +37,26 @@ module Dependabot
 
           sig { returns(T::Hash[String, String]) }
           def dependencies
-            value = object["dependencies"]
+            dependency_group("dependencies").merge(dependency_group("optionalDependencies"))
+          end
+
+          private
+
+          sig { params(group: String).returns(T::Hash[String, String]) }
+          def dependency_group(group)
+            value = object[group]
             return {} if value.nil?
 
-            invalid!("#{@context}.dependencies must be an object") unless value.is_a?(Hash)
+            invalid!("#{@context}.#{group} must be an object") unless value.is_a?(Hash)
             value.to_h do |raw_name, raw_requirement|
               name = T.cast(raw_name, Object)
               requirement = T.cast(raw_requirement, Object)
-              invalid!("#{@context}.dependencies keys must be strings") unless name.is_a?(String)
-              invalid!("#{@context}.dependencies.#{name} must be a string") unless requirement.is_a?(String)
+              invalid!("#{@context}.#{group} keys must be strings") unless name.is_a?(String)
+              invalid!("#{@context}.#{group}.#{name} must be a string") unless requirement.is_a?(String)
 
               [name, requirement]
             end
           end
-
-          private
 
           sig { returns(ObjectHash) }
           def object

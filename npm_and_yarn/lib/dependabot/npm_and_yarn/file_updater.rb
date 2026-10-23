@@ -10,6 +10,7 @@ require "dependabot/package/release_cooldown_options"
 require "dependabot/update_checkers/cooldown_calculation"
 require "dependabot/npm_and_yarn/dependency_files_filterer"
 require "dependabot/npm_and_yarn/sub_dependency_files_filterer"
+require "dependabot/npm_and_yarn/yarn_catalog_security_validation"
 require "dependabot/npm_and_yarn/version"
 require "sorbet-runtime"
 
@@ -23,6 +24,7 @@ module Dependabot
       require_relative "file_updater/yarn_lockfile_updater"
       require_relative "file_updater/pnpm_lockfile_updater"
       require_relative "file_updater/pnpm_workspace_updater"
+      require_relative "file_updater/yarnrc_catalog_updater"
 
       class NoChangeError < StandardError
         extend T::Sig
@@ -45,6 +47,8 @@ module Dependabot
         Helpers.activate_npm_version_selector(dependency_files)
         updated_files = T.let([], T::Array[DependencyFile])
 
+        # Validate the entire catalog edit before any lockfile or artifact work.
+        updated_files += updated_yarn_catalog_files
         updated_files += updated_manifest_files
         updated_files += if pnpm_workspace.any?
                            update_pnpm_workspace_and_locks
@@ -53,6 +57,7 @@ module Dependabot
                          end
 
         handle_pnpm_support_file_no_change!(updated_files)
+        validate_yarn_catalog_security_updates!(updated_files)
 
         if updated_files.none?
           raise NoChangeError.new(
@@ -73,6 +78,46 @@ module Dependabot
       end
 
       private
+
+      sig { params(updated_files: T::Array[DependencyFile]).void }
+      def validate_yarn_catalog_security_updates!(updated_files)
+        return unless dependencies.any? { |dependency| dependency.metadata.key?(:yarn_catalog_security_contracts) }
+
+        files = dependency_files.map { |file| updated_files.find { |updated| updated.path == file.path } || file }
+        YarnCatalogSecurityValidation.validate!(
+          dependency_files: files,
+          dependencies: dependencies,
+          credentials: credentials
+        )
+      end
+
+      sig { returns(T::Array[DependencyFile]) }
+      def updated_yarn_catalog_files
+        catalogs = YarnCatalogs.new(dependency_files: dependency_files)
+        dependencies.each { |dependency| validate_catalog_dependency!(catalogs, dependency) }
+        return [] if catalogs.bindings.empty?
+
+        file = T.must(catalogs.config_file)
+        content = YarnrcCatalogUpdater.new(catalogs: catalogs, dependencies: dependencies).updated_content
+        return [] if content == file.content
+
+        result = updated_file(file: file, content: content)
+        result.support_file = false
+        [result]
+      end
+
+      sig { params(catalogs: YarnCatalogs, dependency: Dependency).void }
+      def validate_catalog_dependency!(catalogs, dependency)
+        catalogs.validate_update!(dependency.name)
+        dependency.requirements.each do |requirement|
+          next unless requirement.metadata_string("yarn_catalog_reference")
+
+          range = T.must(requirement.requirement_string)
+          unless Requirement.requirements_array(range).any? { |req| req.satisfied_by?(Version.new(dependency.version)) }
+            raise DependencyFileNotResolvable, "#{dependency.name}: catalog target does not satisfy #{range}"
+          end
+        end
+      end
 
       sig { params(updated_files: T::Array[DependencyFile]).void }
       def handle_pnpm_support_file_no_change!(updated_files)

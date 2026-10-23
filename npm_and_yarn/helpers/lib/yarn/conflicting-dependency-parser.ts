@@ -19,6 +19,7 @@ import {
   edgeKey,
   type DependencyEdge,
   type NormalizedLockfileEntry,
+  type YarnCatalogs,
 } from "./lockfile-parser.js";
 import { LOCKFILE_ENTRY_REGEX } from "./helpers.js";
 import { findLegacyConflictingDependencies } from "./legacy-conflicting-dependency-parser.js";
@@ -60,7 +61,8 @@ export async function findConflictingDependencies(
   directory: string,
   depName: string,
   targetVersion: string,
-  enableNormalizedTraversal = false
+  enableNormalizedTraversal = false,
+  catalogs: YarnCatalogs = {}
 ): Promise<ConflictingDependency[]> {
   if (!enableNormalizedTraversal) {
     return findLegacyConflictingDependencies(directory, depName, targetVersion);
@@ -69,16 +71,18 @@ export async function findConflictingDependencies(
   return findNormalizedConflictingDependencies(
     directory,
     depName,
-    targetVersion
+    targetVersion,
+    catalogs
   );
 }
 
 async function findNormalizedConflictingDependencies(
   directory: string,
   depName: string,
-  targetVersion: string
+  targetVersion: string,
+  catalogs: YarnCatalogs
 ): Promise<ConflictingDependency[]> {
-  const lockfileJson = await parseNormalized(directory);
+  const lockfileJson = await parseNormalized(directory, catalogs);
   const packageJson = fs
     .readFileSync(path.join(directory, "package.json"))
     .toString();
@@ -98,7 +102,7 @@ async function findNormalizedConflictingDependencies(
 
   // Normalize manifest requirements to match lockfile descriptors.
   const topLevelEdges = topLevelDependencies.map(([name, requirement]) =>
-    normalizeDependencyEdge(name, requirement, lockfileJson)
+    normalizeDependencyEdge(name, requirement, lockfileJson, catalogs)
   );
   const topLevelWorkspaceNames = new Set(
     topLevelEdges

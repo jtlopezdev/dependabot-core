@@ -24,6 +24,50 @@ describe("findConflictingDependencies", () => {
   });
   afterEach(() => fs.rm(tempDir, { recursive: true }, () => {}));
 
+  it.each(["berry-simple", "berry-workspace"])(
+    "traverses catalog edges from manifests and workspaces in %s",
+    async (fixture) => {
+      helpers.copyDependencies(
+        `conflicting-dependency-parser/${fixture}`,
+        tempDir
+      );
+      const reference =
+        fixture === "berry-simple" ? "catalog:" : "catalog:default";
+      const manifestPath = path.join(tempDir, "package.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (manifest.dependencies?.objnest)
+        manifest.dependencies.objnest = reference;
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      const lockPath = path.join(tempDir, "yarn.lock");
+      fs.writeFileSync(
+        lockPath,
+        fs
+          .readFileSync(lockPath, "utf8")
+          .replaceAll('objnest: "npm:^4.1.2"', `objnest: "${reference}"`)
+      );
+
+      const result = await findConflictingDependencies(
+        tempDir,
+        "abind",
+        "2.0.0",
+        true,
+        {
+          [reference]: { objnest: "^4.1.2" },
+        }
+      );
+      expect(result).toEqual([
+        expect.objectContaining({
+          name: "objnest",
+          version: "4.1.4",
+          requirement: "^1.0.0",
+        }),
+      ]);
+      await expect(
+        findConflictingDependencies(tempDir, "abind", "2.0.0", true, {})
+      ).rejects.toThrow(/objnest.*catalog:/);
+    }
+  );
+
   it("finds conflicting dependencies", async () => {
     helpers.copyDependencies("conflicting-dependency-parser/simple", tempDir);
 

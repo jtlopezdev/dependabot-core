@@ -16,6 +16,7 @@ require "dependabot/npm_and_yarn/version"
 require "dependabot/npm_and_yarn/requirement"
 require "dependabot/npm_and_yarn/package_manager"
 require "dependabot/npm_and_yarn/registry_parser"
+require "dependabot/npm_and_yarn/yarn_catalogs"
 require "dependabot/git_metadata_fetcher"
 require "dependabot/git_commit_checker"
 require "dependabot/errors"
@@ -63,6 +64,7 @@ module Dependabot
         dependency_set += manifest_dependencies
         dependency_set += lockfile_dependencies
         dependency_set += workspace_catalog_dependencies if pnpm_workspace_yml
+        dependency_set += yarn_catalog_dependencies
 
         dependencies = Helpers.dependencies_with_all_versions_metadata(dependency_set)
 
@@ -72,6 +74,10 @@ module Dependabot
           # Ignore dependencies defined in support files, since we don't want PRs for those
           support_reqs = reqs.select { |r| support_package_files.any? { |f| f.name == r.file } }
           next true if support_reqs.any?
+
+          # Preserve unsupported catalog arrangements in direct inventory so
+          # the checker can report their explicit unsupported-binding error.
+          next false if yarn_catalog_dependency?(dep)
 
           # TODO: Currently, Dependabot can't handle dependencies that have both
           # a git source *and* a non-git source. Fix that!
@@ -105,6 +111,11 @@ module Dependabot
       end
 
       private
+
+      sig { params(dependency: Dependency).returns(T::Boolean) }
+      def yarn_catalog_dependency?(dependency)
+        dependency.requirements.any? { |requirement| requirement.metadata_string("yarn_catalog_reference") }
+      end
 
       sig { returns(PackageManagerHelper) }
       def package_manager_helper
@@ -284,6 +295,35 @@ module Dependabot
           end
         end
 
+        dependency_set
+      end
+
+      sig { returns(Dependabot::FileParsers::Base::DependencySet) }
+      def yarn_catalog_dependencies
+        catalogs = YarnCatalogs.new(dependency_files: dependency_files)
+        dependency_set = DependencySet.new
+        catalogs.bindings.each do |binding|
+          next if catalogs.workspace_dependency?(binding)
+
+          details = catalogs.lockfile_details(binding)
+          if yarn_lock && !details&.version && catalogs.registry_requirement?(binding.requirement)
+            raise DependencyFileNotResolvable,
+                  "#{binding.name}@#{binding.reference}: no matching catalog lockfile entry"
+          end
+
+          dependency_set << Dependency.new(
+            name: binding.name,
+            version: details&.version,
+            package_manager: ECOSYSTEM,
+            requirements: [{
+              requirement: binding.requirement,
+              file: T.must(catalogs.config_file).name,
+              groups: binding.groups,
+              source: source_for(binding.name, binding.requirement, details),
+              metadata: { yarn_catalog_reference: binding.reference, yarn_catalog_package: binding.name }
+            }]
+          )
+        end
         dependency_set
       end
 

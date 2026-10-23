@@ -192,4 +192,51 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::BerryLockfileHandler do
       expect(File.read(lockfile_path)).to eq(original)
     end
   end
+
+  describe ".rebind_descriptor" do
+    it "moves only the selected scoped descriptor and preserves both resolutions' other consumers" do
+      Dir.mktmpdir do |directory|
+        path = File.join(directory, "yarn.lock")
+        File.write(path, <<~YAML)
+          # Keep lockfile comments
+          "@scope/pkg@npm:2.8.6, @scope/pkg@npm:~2.8.6":
+            version: 2.8.6
+            checksum: selected
+
+          "@scope/pkg@npm:^2.8.6, @scope/pkg@npm:~2.8.8":
+            version: 2.8.8
+            checksum: other
+        YAML
+
+        described_class.rebind_descriptor(path, "@scope/pkg@npm:2.8.6", "@scope/pkg@npm:^2.8.6")
+
+        parsed = described_class.parse(path)
+        %w(2.8.6 ~2.8.6 ^2.8.6).each do |range|
+          expect(described_class.descriptor_version(parsed, "@scope/pkg@npm:#{range}")).to eq("2.8.6")
+        end
+        expect(described_class.descriptor_version(parsed, "@scope/pkg@npm:~2.8.8")).to eq("2.8.8")
+        expect(File.read(path)).to include("# Keep lockfile comments", "checksum: selected", "checksum: other")
+      end
+    end
+
+    it "removes an occupied destination without deleting the following entry" do
+      Dir.mktmpdir do |directory|
+        path = File.join(directory, "yarn.lock")
+        File.write(path, <<~YAML)
+          "prettier@npm:2.8.6":
+            version: 2.8.6
+
+          "prettier@npm:^2.8.6":
+            version: 2.8.8
+
+          "other@npm:1.0.0":
+            version: 1.0.0
+        YAML
+        described_class.rebind_descriptor(path, "prettier@npm:2.8.6", "prettier@npm:^2.8.6")
+        parsed = described_class.parse(path)
+        expect(described_class.descriptor_version(parsed, "prettier@npm:^2.8.6")).to eq("2.8.6")
+        expect(parsed.fetch("other@npm:1.0.0").fetch("version")).to eq("1.0.0")
+      end
+    end
+  end
 end

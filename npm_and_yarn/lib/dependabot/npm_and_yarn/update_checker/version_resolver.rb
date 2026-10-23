@@ -11,6 +11,7 @@ require "dependabot/npm_and_yarn/dependency_files_filterer"
 require "dependabot/npm_and_yarn/file_parser"
 require "dependabot/npm_and_yarn/file_updater/npmrc_builder"
 require "dependabot/npm_and_yarn/file_updater/package_json_preparer"
+require "dependabot/npm_and_yarn/file_updater/yarnrc_catalog_updater"
 require "dependabot/npm_and_yarn/helpers"
 require "dependabot/npm_and_yarn/native_helpers"
 require "dependabot/npm_and_yarn/pnpm_error_message"
@@ -182,6 +183,16 @@ module Dependabot
           return latest_allowable_version unless has_unmet_peers
 
           satisfying_versions.first
+        end
+
+        sig { params(version: Dependabot::Version).returns(T::Boolean) }
+        def catalog_version_resolvable?(version)
+          errors = fetch_peer_dependency_errors(version: version).select do |error|
+            error.requirement_name == dependency.name || error.requiring_dep_name == dependency.name
+          end
+          errors.none? do |error|
+            old_peer_dependency_errors.none? { |old| old.same_dependencies?(error) }
+          end
         end
 
         sig { returns(T::Boolean) }
@@ -561,10 +572,18 @@ module Dependabot
               # for one, replaces a `catalog:` specifier with the pinned
               # version. When this runs in the repo's working tree the
               # FileUpdater reuses those files, so put the originals back.
-              dependency_files_builder.write_temporary_dependency_files
+              if yarn_catalogs.bindings.any?
+                dependency_files_builder.restore_temporary_dependency_files
+              else
+                dependency_files_builder.write_temporary_dependency_files
+              end
             end
           end
         rescue SharedHelpers::HelperSubprocessFailed => e
+          if yarn_catalogs.bindings.any? { |binding| binding.name == dependency.name }
+            raise DependencyFileNotResolvable, e.message
+          end
+
           if trust_downgrade_error?(e)
             Dependabot.logger.warn(
               "pnpm trust downgrade detected during peer dependency check; version will be skipped"
@@ -865,6 +884,10 @@ module Dependabot
           ).returns(T::Array[PeerDependencyConflict])
         end
         def run_yarn_berry_checker(path:, version:)
+          if yarn_catalogs.bindings.any? { |binding| binding.name == dependency.name }
+            return run_yarn_catalog_checker(version: version)
+          end
+
           # This method mimics calling a native helper in order to comply with the caller's expectations
           # Specifically we add the dependency at the specified updated version
           # then check the output of the add command for Peer Dependency errors (Denoted by YN0060)
@@ -881,6 +904,28 @@ module Dependabot
                   error_context: {}
                 )
               end
+            end
+          end
+          []
+        end
+
+        sig { returns(YarnCatalogs) }
+        def yarn_catalogs
+          @yarn_catalogs ||= T.let(YarnCatalogs.new(dependency_files: dependency_files), T.nilable(YarnCatalogs))
+        end
+
+        sig { params(version: T.nilable(T.any(String, Gem::Version))).returns(T::Array[PeerDependencyConflict]) }
+        def run_yarn_catalog_checker(version:)
+          yarn_catalogs.validate_update!(dependency.name)
+          editor = FileUpdater::YarnrcCatalogUpdater.new(catalogs: yarn_catalogs, dependencies: [])
+          content = editor.updated_content(pins: { dependency.name => T.must(version).to_s })
+                          .gsub(/"\$\{.*?}"/, '"DUMMYCREDS"').gsub(/\$\{.*?}/, '"DUMMYCREDS"')
+          File.write(".yarnrc.yml", content)
+          yarn_catalogs.validate_yarn_version!(Helpers.yarn_version)
+          SharedHelpers.with_git_configured(credentials: credentials) do
+            output = Helpers.run_yarn_command("install #{Helpers.yarn_berry_args}".strip)
+            if output.include?("YN0060")
+              raise SharedHelpers::HelperSubprocessFailed.new(message: output, error_context: {})
             end
           end
           []
