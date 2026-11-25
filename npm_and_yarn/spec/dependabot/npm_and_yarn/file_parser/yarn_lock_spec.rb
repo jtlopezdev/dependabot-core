@@ -28,6 +28,42 @@ RSpec.describe Dependabot::NpmAndYarn::FileParser::YarnLock do
       .to have_attributes(version: "1.2.0", resolution: "example@npm:1.2.0")
   end
 
+  it "requires an exact descriptor when strict lookup is requested" do
+    expect(reader.details("example", "^9.0.0", ".yarnrc.yml", strict: true)).to be_nil
+    expect(reader.details("example", "~1.2.0", ".yarnrc.yml", strict: true))
+      .to have_attributes(version: "1.2.0")
+  end
+
+  context "with grouped Yarn Berry descriptors" do
+    let(:file) { Dependabot::DependencyFile.new(name: "yarn.lock", content: lockfile_content) }
+    let(:lockfile_content) do
+      <<~YAML
+        __metadata:
+          version: 8
+
+        "aa-printer@npm:prettier@2.8.0, prettier@npm:2.8.0":
+          version: 2.8.0
+          resolution: "prettier@npm:2.8.0"
+
+        "local-@npm:^1.0.0, local-@workspace:packages/local":
+          version: 0.0.0-use.local
+          resolution: "local-@workspace:packages/local"
+      YAML
+    end
+
+    before { allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).and_call_original }
+
+    it "finds the strict descriptor when an alias starts the group" do
+      expect(reader.details("prettier", "2.8.0", ".yarnrc.yml", strict: true))
+        .to have_attributes(version: "2.8.0", resolution: "prettier@npm:2.8.0")
+    end
+
+    it "finds the workspace resolution of a package whose name ends in a hyphen" do
+      expect(reader.details("local-", "^1.0.0", ".yarnrc.yml", strict: true))
+        .to have_attributes(resolution: "local-@workspace:packages/local")
+    end
+  end
+
   context "when the requirement is only a prefix of another descriptor" do
     let(:result) do
       {
@@ -107,6 +143,45 @@ RSpec.describe Dependabot::NpmAndYarn::FileParser::YarnLock do
     it "reports the child requirement type" do
       expect { reader.parsed.values.first.dependencies }
         .to raise_error(Dependabot::DependencyFileNotParseable, /dependencies.*child.*must be a string/)
+    end
+  end
+
+  describe "nullable requirement maps" do
+    it "distinguishes unspecified maps from the graph reader's empty map" do
+      record = reader.parsed.values.first
+
+      expect(record.dependency_requirements).to be_nil
+      expect(record.optional_dependencies).to be_nil
+      expect(record.dependencies).to eq({})
+    end
+
+    [nil, {}, { "child" => "npm:other@^2", "@scope/local" => "link:../local" }].each do |value|
+      context "with both maps set to #{value.inspect}" do
+        let(:entry) { super().merge("dependencies" => value, "optionalDependencies" => value) }
+
+        it "preserves absent and explicit requirement maps" do
+          record = reader.parsed.values.first
+
+          expect(record.dependency_requirements).to eq(value)
+          expect(record.optional_dependencies).to eq(value)
+          expect(record.dependencies).to eq(value || {})
+        end
+      end
+    end
+
+    [[], { "child" => false }].each do |value|
+      context "with malformed optional requirements #{value.inspect}" do
+        let(:entry) { super().merge("optionalDependencies" => value) }
+
+        it "only reports the field when optional dependencies are read" do
+          record = reader.parsed.values.first
+          expect(record.dependencies).to eq({})
+          expect { record.optional_dependencies }
+            .to raise_error(Dependabot::DependencyFileNotParseable, /optionalDependencies/) do |error|
+            expect(error.file_name).to eq("yarn.lock")
+          end
+        end
+      end
     end
   end
 
