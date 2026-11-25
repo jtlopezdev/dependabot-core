@@ -10,10 +10,17 @@ module Dependabot
       class YarnRelationshipResolver
         extend T::Sig
 
-        sig { params(lockfile: Dependabot::DependencyFile, catalogs: T::Hash[String, T::Hash[String, String]]).void }
-        def initialize(lockfile, catalogs: {})
+        sig do
+          params(
+            lockfile: Dependabot::DependencyFile,
+            catalogs: T::Hash[String, T::Hash[String, String]],
+            overridden_catalog: T.nilable(T.proc.params(name: String).returns(T::Boolean))
+          ).void
+        end
+        def initialize(lockfile, catalogs: {}, overridden_catalog: nil)
           @lockfile = lockfile
           @catalogs = catalogs
+          @overridden_catalog = overridden_catalog
         end
 
         sig { returns(T::Hash[String, T::Array[String]]) }
@@ -54,6 +61,10 @@ module Dependabot
         end
         def resolve_child_version(child_name, child_req, parsed)
           catalog_reference = child_req if child_req.start_with?("catalog:")
+          # Graph submission can retain the other relationships when a root resolution
+          # makes this specific catalog edge unprovable. Security checks remain strict.
+          return if catalog_reference && @overridden_catalog&.call(child_name)
+
           child_req = catalog_requirement(child_name, child_req) if catalog_reference
           version = descriptor_version("#{child_name}@#{child_req}", parsed)
           return version if version

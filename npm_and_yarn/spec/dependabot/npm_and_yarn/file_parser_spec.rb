@@ -82,6 +82,17 @@ RSpec.describe Dependabot::NpmAndYarn::FileParser do
       end
     end
 
+    context "when a root resolution redirects a catalog dependency to a workspace" do
+      let(:files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+      it "keeps a matching transitive registry descriptor out of the direct requirements" do
+        dependencies = parser.parse
+        expect(dependencies.find { |dep| dep.name == "is-number" }.requirements).to be_empty
+        expect(dependencies.find { |dep| dep.name == "prettier" }.requirements.map(&:file)).to eq([".yarnrc.yml"])
+        expect(dependencies.find { |dep| dep.name == "is-odd" }.requirements.map(&:file)).to eq(["package.json"])
+      end
+    end
+
     context "when the catalog resolves to a local workspace" do
       let(:files) { project_dependency_files("yarn_berry/catalog_transparent_workspace") }
 

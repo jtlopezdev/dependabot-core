@@ -1,0 +1,16 @@
+{
+  "name": "catalog-override",
+  "private": true,
+  "packageManager": "yarn@4.10.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "is-number": "catalog:",
+    "is-odd": "2.0.0",
+    "prettier": "catalog:"
+  },
+  "resolutions": {
+    "is-number@catalog:": "workspace:packages/number"
+  }
+}

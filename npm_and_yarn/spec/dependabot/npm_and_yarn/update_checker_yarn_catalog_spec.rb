@@ -36,6 +36,26 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
     stub_request(:head, "https://registry.npmjs.org/prettier/-/prettier-2.8.6.tgz").to_return(status: 200)
   end
 
+  context "when a root resolution takes precedence over a catalog reference" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+    it "still finds the selected version for an unrelated catalog dependency" do
+      expect(checker.updated_dependencies(requirements_to_unlock: :all).map(&:version)).to eq(["2.8.6"])
+    end
+
+    context "when checking the overridden package" do
+      let(:dependency) do
+        Dependabot::NpmAndYarn::FileParser.new(dependency_files: files, source: nil).parse
+                                          .find { |dep| dep.name == "is-number" }
+      end
+
+      it "declines the override even though the lockfile contains a registry version" do
+        expect { checker.can_update?(requirements_to_unlock: :all) }
+          .to raise_error(Dependabot::ToolFeatureNotSupported, /resolution/)
+      end
+    end
+  end
+
   it "carries the policy-selected target from checking through installation and becomes up to date" do
     expect(checker.can_update?(requirements_to_unlock: :all)).to be true
     updated_dependencies = checker.updated_dependencies(requirements_to_unlock: :all)

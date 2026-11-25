@@ -93,6 +93,17 @@ RSpec.describe Dependabot::NpmAndYarn::DependencyGrapher do
       end
     end
 
+    context "with a root resolution overriding a Yarn catalog" do
+      let(:dependency_files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+      it "preserves the other direct packages and their transitive relationships" do
+        resolved = grapher.resolved_dependencies
+        expect(resolved.fetch("pkg:npm/prettier@2.8.0").direct).to be(true)
+        expect(resolved.fetch("pkg:npm/is-odd@2.0.0").dependencies).to include("pkg:npm/is-number@4.0.0")
+        expect(resolved.fetch("pkg:npm/is-number@4.0.0").direct).to be(false)
+      end
+    end
+
     context "with an aliased dependency" do
       let(:dependency_files) { project_dependency_files("grapher/npm_with_alias") }
 
