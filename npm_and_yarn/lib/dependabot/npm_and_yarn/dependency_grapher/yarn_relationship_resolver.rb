@@ -86,6 +86,9 @@ module Dependabot
         end
         def resolve_children(children, parsed)
           children.filter_map do |child_name, child_req|
+            # Submission can omit an overridden catalog edge while retaining the other relationships.
+            next if child_req.start_with?("catalog:") && @overridden_catalog&.call(child_name)
+
             version = resolve_child_version(child_name, child_req, parsed)
             "#{child_name}@#{version}" if version
           end
@@ -97,10 +100,6 @@ module Dependabot
         end
         def resolve_child_version(child_name, child_req, parsed)
           catalog_reference = child_req if child_req.start_with?("catalog:")
-          # Graph submission can retain the other relationships when a root resolution
-          # makes this specific catalog edge unprovable. Security checks remain strict.
-          return if catalog_reference && @overridden_catalog&.call(child_name)
-
           child_req = catalog_requirement(child_name, child_req) if catalog_reference
           version = descriptor_record("#{child_name}@#{child_req}", parsed)&.version
           return version if version
