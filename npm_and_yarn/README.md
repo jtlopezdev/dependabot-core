@@ -12,8 +12,9 @@ a repository subdirectory. Both ordinary and lockfile-only updates retain Depend
 The initial scope is one active catalog identity per package name, shared by any number of workspaces, with plain
 registry semver ranges in `dependencies` and `devDependencies`. Many catalogs and different catalog packages may be
 updated together. A package consumed through multiple catalog identities, or through both a catalog and an ordinary
-direct declaration, reports an unsupported feature. Catalog ranges resolved to local workspaces are excluded from
-registry updates. Inherited configuration, plugin catalogs, and selected YAML aliases or anchors are also outside this scope.
+direct declaration, reports an unsupported feature. Dependabot skips catalog updates for a package when a root
+`resolutions` rule redirects one of its consumers or when the range resolves to a local workspace. Inherited
+configuration, plugin catalogs, and selected YAML aliases or anchors are also outside this scope.
 
 Catalog edges participate in dependency graph and conflict traversal. Security updates for ordinary direct dependencies
 and transitive dependencies outside the installed catalog dependency trees remain available. Security updates for catalog
