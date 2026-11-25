@@ -2,7 +2,6 @@
 # frozen_string_literal: true
 
 require "sorbet-runtime"
-require "dependabot/npm_and_yarn/yarn_catalog_security_validation"
 
 module Dependabot
   class Updater
