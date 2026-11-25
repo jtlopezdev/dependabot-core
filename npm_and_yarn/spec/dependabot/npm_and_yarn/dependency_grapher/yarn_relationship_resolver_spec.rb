@@ -56,6 +56,44 @@ RSpec.describe Dependabot::NpmAndYarn::DependencyGrapher::YarnRelationshipResolv
     end
   end
 
+  describe "#independent_of_catalogs?" do
+    let(:resolver) { described_class.new(lockfile, catalogs: { "catalog:" => { "a" => "^1" } }) }
+    let(:result) do
+      {
+        "a@npm:1.0.0, a@npm:^1" => {
+          "version" => "1.0.0", "resolution" => "a@npm:1.0.0", "dependencies" => { "b" => "npm:^1" }
+        },
+        "b@npm:^1" => {
+          "version" => "1.0.0", "resolution" => "b@npm:1.0.0", "optionalDependencies" => { "a" => "npm:^1" }
+        },
+        "a@npm:^2" => {
+          "version" => "2.0.0", "resolution" => "a@npm:2.0.0", "dependencies" => { "elsewhere" => "npm:^1" }
+        }
+      }
+    end
+
+    it "follows exact grouped descriptors and optional edges through cycles without visiting the other version" do
+      expect(resolver.independent_of_catalogs?("elsewhere") { false }).to be(true)
+      expect(resolver.independent_of_catalogs?("b") { false }).to be(false)
+    end
+
+    it "requires every catalog descendant to have a matching record even if the name has only one candidate" do
+      result.fetch("a@npm:1.0.0, a@npm:^1")["dependencies"] = { "b" => "npm:^2" }
+      expect(resolver.independent_of_catalogs?("elsewhere") { false }).to be(false)
+    end
+
+    it "requires a mapping for installed catalog edges even outside the discovered workspaces" do
+      result["nested@workspace:packages/tools/child"] = {
+        "version" => "0.0.0-use.local", "dependencies" => { "b" => "catalog:unseen" }
+      }
+      expect(resolver.independent_of_catalogs?("elsewhere") { false }).to be(false)
+    end
+
+    it "keeps a potential resolution override on a catalog descendant out of the ordinary path" do
+      expect(resolver.independent_of_catalogs?("elsewhere") { |name| name == "b" }).to be(false)
+    end
+  end
+
   context "with null child data" do
     let(:result) { { "parent@^1" => { "version" => "1.0.0", "dependencies" => nil } } }
 

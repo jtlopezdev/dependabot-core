@@ -4,6 +4,7 @@
 require "dependabot/git_commit_checker"
 require "dependabot/requirements_update_strategy"
 require "dependabot/shared_helpers"
+require "dependabot/npm_and_yarn/dependency_grapher"
 require "dependabot/npm_and_yarn/helpers"
 require "dependabot/npm_and_yarn/package_manager"
 require "dependabot/update_checkers"
@@ -74,7 +75,9 @@ module Dependabot
           {}, T::Hash[T.nilable(Symbol), T.nilable(T::Array[Dependency])]
         )
         super
-        YarnCatalogs.new(dependency_files: dependency_files).validate_update!(dependency.name)
+        @yarn_catalogs = T.let(YarnCatalogs.new(dependency_files: dependency_files), YarnCatalogs)
+        @yarn_catalogs.validate_update!(dependency.name)
+        @transitive_catalog_security_update = T.let(nil, T.nilable(T::Boolean))
         Helpers.dependency_files = dependency_files
         Helpers.credentials = credentials
         Helpers.activate_npm_version_selector(dependency_files)
@@ -340,9 +343,16 @@ module Dependabot
 
       sig { returns(T::Boolean) }
       def transitive_catalog_security_update?
-        !dependency.top_level? && security_advisories.any? &&
-          dependency_files.any? { |file| file.name == "yarn.lock" } &&
-          YarnCatalogs.new(dependency_files: dependency_files).bindings.any?
+        return false if dependency.top_level? || security_advisories.empty? || @yarn_catalogs.bindings.empty?
+        return @transitive_catalog_security_update unless @transitive_catalog_security_update.nil?
+
+        lock = dependency_files.find { |file| file.name == "yarn.lock" }
+        return false unless lock
+
+        graph = DependencyGrapher::YarnRelationshipResolver.new(lock, catalogs: @yarn_catalogs.helper_catalogs)
+        @transitive_catalog_security_update = !graph.independent_of_catalogs?(dependency.name) do |name|
+          @yarn_catalogs.resolution_targets?(name)
+        end
       end
 
       sig { returns(T::Boolean) }

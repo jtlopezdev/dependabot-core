@@ -42,6 +42,21 @@ module Dependabot
         end
       end
 
+      # Separate classes per package manager so error reports are grouped
+      # per package manager instead of rolled up into one issue.
+      class NpmNoChangeError < NoChangeError; end
+      class YarnNoChangeError < NoChangeError; end
+      class PnpmNoChangeError < NoChangeError; end
+
+      NO_CHANGE_ERROR_CLASSES = T.let(
+        {
+          "npm" => NpmNoChangeError,
+          "yarn" => YarnNoChangeError,
+          "pnpm" => PnpmNoChangeError
+        }.freeze,
+        T::Hash[String, T.class_of(NoChangeError)]
+      )
+
       sig { override.returns(T::Array[DependencyFile]) }
       def updated_dependency_files
         Helpers.activate_npm_version_selector(dependency_files)
@@ -60,7 +75,7 @@ module Dependabot
         validate_yarn_catalog_security_updates!(updated_files)
 
         if updated_files.none?
-          raise NoChangeError.new(
+          raise no_change_error_class.new(
             message: "No files were updated! Package manager: #{detected_package_manager}",
             error_context: error_context(updated_files: updated_files)
           )
@@ -68,7 +83,7 @@ module Dependabot
 
         sorted_updated_files = updated_files.sort_by(&:name)
         if sorted_updated_files == filtered_dependency_files.sort_by(&:name)
-          raise NoChangeError.new(
+          raise no_change_error_class.new(
             message: "Updated files are unchanged! Package manager: #{detected_package_manager}",
             error_context: error_context(updated_files: updated_files)
           )
@@ -117,6 +132,11 @@ module Dependabot
             raise DependencyFileNotResolvable, "#{dependency.name}: catalog target does not satisfy #{range}"
           end
         end
+      end
+
+      sig { returns(T.class_of(NoChangeError)) }
+      def no_change_error_class
+        NO_CHANGE_ERROR_CLASSES.fetch(detected_package_manager, NoChangeError)
       end
 
       sig { params(updated_files: T::Array[DependencyFile]).void }
@@ -200,7 +220,11 @@ module Dependabot
       sig { returns(String) }
       def vendor_cache_dir
         @vendor_cache_dir ||= T.let(
-          Helpers.fetch_yarnrc_yml_value("cacheFolder", "./.yarn/cache"),
+          Helpers.fetch_yarnrc_yml_value(
+            "cacheFolder",
+            "./.yarn/cache",
+            dependency_files: dependency_files
+          ),
           T.nilable(String)
         )
       end
@@ -208,7 +232,11 @@ module Dependabot
       sig { returns(String) }
       def install_state_path
         @install_state_path ||= T.let(
-          Helpers.fetch_yarnrc_yml_value("installStatePath", "./.yarn/install-state.gz"),
+          Helpers.fetch_yarnrc_yml_value(
+            "installStatePath",
+            "./.yarn/install-state.gz",
+            dependency_files: dependency_files
+          ),
           T.nilable(String)
         )
       end

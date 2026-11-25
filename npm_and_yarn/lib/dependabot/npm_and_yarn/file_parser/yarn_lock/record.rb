@@ -37,22 +37,32 @@ module Dependabot
 
           sig { returns(T::Hash[String, String]) }
           def dependencies
-            dependency_group("dependencies").merge(dependency_group("optionalDependencies"))
+            (dependency_requirements || {}).merge(optional_dependencies || {})
+          end
+
+          sig { returns(T.nilable(T::Hash[String, String])) }
+          def dependency_requirements
+            requirement_map("dependencies")
+          end
+
+          sig { returns(T.nilable(T::Hash[String, String])) }
+          def optional_dependencies
+            requirement_map("optionalDependencies")
           end
 
           private
 
-          sig { params(group: String).returns(T::Hash[String, String]) }
-          def dependency_group(group)
-            value = object[group]
-            return {} if value.nil?
+          sig { params(field: String).returns(T.nilable(T::Hash[String, String])) }
+          def requirement_map(field)
+            value = object[field]
+            return if value.nil?
 
-            invalid!("#{@context}.#{group} must be an object") unless value.is_a?(Hash)
+            invalid!("#{@context}.#{field} must be an object") unless value.is_a?(Hash)
             value.to_h do |raw_name, raw_requirement|
               name = T.cast(raw_name, Object)
               requirement = T.cast(raw_requirement, Object)
-              invalid!("#{@context}.#{group} keys must be strings") unless name.is_a?(String)
-              invalid!("#{@context}.#{group}.#{name} must be a string") unless requirement.is_a?(String)
+              invalid!("#{@context}.#{field} keys must be strings") unless name.is_a?(String)
+              invalid!("#{@context}.#{field}.#{name} must be a string") unless requirement.is_a?(String)
 
               [name, requirement]
             end

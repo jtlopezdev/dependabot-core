@@ -36,6 +36,26 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
     stub_request(:head, "https://registry.npmjs.org/prettier/-/prettier-2.8.6.tgz").to_return(status: 200)
   end
 
+  context "when a root resolution takes precedence over a catalog reference" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+    it "still finds the selected version for an unrelated catalog dependency" do
+      expect(checker.updated_dependencies(requirements_to_unlock: :all).map(&:version)).to eq(["2.8.6"])
+    end
+
+    context "when checking the overridden package" do
+      let(:dependency) do
+        Dependabot::NpmAndYarn::FileParser.new(dependency_files: files, source: nil).parse
+                                          .find { |dep| dep.name == "is-number" }
+      end
+
+      it "declines the override even though the lockfile contains a registry version" do
+        expect { checker.can_update?(requirements_to_unlock: :all) }
+          .to raise_error(Dependabot::ToolFeatureNotSupported, /resolution/)
+      end
+    end
+  end
+
   it "carries the policy-selected target from checking through installation and becomes up to date" do
     expect(checker.can_update?(requirements_to_unlock: :all)).to be true
     updated_dependencies = checker.updated_dependencies(requirements_to_unlock: :all)
@@ -301,6 +321,43 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
         expect(target.all_versions.map { |version| Dependabot::NpmAndYarn::Version.new(version) })
           .to all(be >= Dependabot::NpmAndYarn::Version.new("3.0.5"))
       end
+    end
+  end
+
+  context "with a vulnerable transitive dependency on a separate branch from the catalog" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_unrelated_security") }
+    let(:ignored_versions) { [] }
+    let(:dependency) do
+      parser = Dependabot::NpmAndYarn::FileParser.new(dependency_files: files, source: nil)
+      parser.parse.find { |dep| dep.name == "ansi-regex" }
+    end
+    let(:security_advisories) do
+      [Dependabot::SecurityAdvisory.new(
+        dependency_name: "ansi-regex", package_manager: "npm_and_yarn", vulnerable_versions: [">= 5.0.0, < 5.0.1"]
+      )]
+    end
+
+    before do
+      listing = {
+        "name" => "ansi-regex", "dist-tags" => { "latest" => "5.0.1" },
+        "versions" => %w(5.0.0 5.0.1).to_h { |version| [version, { "version" => version }] }
+      }
+      stub_request(:get, "https://registry.npmjs.org/ansi-regex").to_return(status: 200, body: listing.to_json)
+      stub_request(:get, "https://registry.npmjs.org/ansi-regex/latest").to_return(status: 200, body: "{}")
+      stub_request(:head, "https://registry.npmjs.org/ansi-regex/-/ansi-regex-5.0.1.tgz").to_return(status: 200)
+    end
+
+    it "repairs the vulnerable package in the lockfile without changing the catalog workspace" do
+      updates = checker.updated_dependencies(requirements_to_unlock: :none)
+      expect(updates.map { |dep| [dep.name, dep.version] }).to eq([["ansi-regex", "5.0.1"]])
+
+      changed = Dependabot::NpmAndYarn::FileUpdater.new(
+        dependencies: updates, dependency_files: files, credentials: [], options: { security_updates_only: true }
+      ).updated_dependency_files
+      expect(changed.map(&:name)).to eq(["yarn.lock"])
+      lock = YAML.safe_load(changed.first.content)
+      expect(lock.fetch("ansi-regex@npm:^5.0.0").fetch("version")).to eq("5.0.1")
+      expect(lock.fetch("formatting@workspace:packages/formatting").dig("dependencies", "prettier")).to eq("catalog:")
     end
   end
 

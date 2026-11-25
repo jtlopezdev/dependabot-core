@@ -80,6 +80,11 @@ RSpec.describe Dependabot::NpmAndYarn::YarnCatalogs do
         expect(catalogs.bindings).to eq([])
       end
 
+      it "does not infer Yarn from a nested project's lockfile" do
+        files.find { |file| file.name == "yarn.lock" }.name = "packages/child/yarn.lock"
+        expect(catalogs.bindings).to eq([])
+      end
+
       %w(package-lock.json npm-shrinkwrap.json pnpm-lock.yaml pnpm-workspace.yaml).each do |name|
         it "does not infer Yarn when #{name} also identifies a package manager project" do
           files << Dependabot::DependencyFile.new(name: name, content: "{}")
@@ -194,7 +199,7 @@ RSpec.describe Dependabot::NpmAndYarn::YarnCatalogs do
     expect { catalogs.validate_update!("prettier") }.to raise_error(Dependabot::ToolFeatureNotSupported, /ordinary/)
   end
 
-  context "when the catalog resolves to a local workspace" do
+  context "when checking a catalog dependency resolved to a local workspace" do
     let(:files) { project_dependency_files("yarn_berry/catalog_transparent_workspace") }
 
     it "keeps residual lockfile inventory from entering a registry update check" do
@@ -220,9 +225,246 @@ RSpec.describe Dependabot::NpmAndYarn::YarnCatalogs do
     end.to raise_error(Dependabot::ToolFeatureNotSupported, /optionalDependencies/)
   end
 
-  it "retains inherited configuration identity but rejects editing outside the project root" do
-    config.name = "../.yarnrc.yml"
-    expect(catalogs.bindings.first.reference).to eq("catalog:")
+  ["../.yarnrc.yml", "packages/child/.yarnrc.yml"].each do |name|
+    it "ignores #{name} when the project root configuration is missing" do
+      config.name = name
+      expect(catalogs.config_file).to be_nil
+      expect { catalogs.bindings }.to raise_error(Dependabot::DependencyFileNotResolvable, /configuration/)
+    end
+  end
+
+  it "uses the root configuration even if a nested configuration appears first" do
+    files.unshift(Dependabot::DependencyFile.new(name: "packages/child/.yarnrc.yml", content: "invalid: [\n"))
+    expect(catalogs.config_file).to eq(config)
+    expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+  end
+
+  it "uses the root lockfile even if a nested lockfile appears first" do
+    files.unshift(Dependabot::DependencyFile.new(name: "packages/child/yarn.lock", content: "invalid: [\n"))
+    expect(catalogs.lockfile_details(catalogs.bindings.first).resolution).to eq("prettier@npm:2.8.0")
+  end
+
+  it "does not read a nested lockfile when the root lockfile is missing" do
+    files.find { |file| file.name == "yarn.lock" }.name = "packages/child/yarn.lock"
+    expect(catalogs.lockfile_details(catalogs.bindings.first)).to be_nil
     expect { catalogs.validate_update!("prettier") }.to raise_error(Dependabot::ToolFeatureNotSupported, /project root/)
+  end
+
+  it "inventories and rejects catalog consumption in optionalDependencies" do
+    child.content = child.content.sub('"dependencies"', '"optionalDependencies"')
+    expect(catalogs.bindings.first.groups).to include("optionalDependencies")
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /optionalDependencies/)
+  end
+
+  it "rejects a catalog development dependency also declared as a catalog peer" do
+    child.content = child.content.sub('"dependencies"', '"peerDependencies"')
+    expect(catalogs.bindings.first.groups).to eq(["devDependencies"])
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+  end
+
+  it "rejects peer-only catalog consumption" do
+    root.content = root.content.sub('"devDependencies"', '"peerDependencies"')
+    child.content = child.content.sub('"dependencies"', '"peerDependencies"')
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+    expect(catalogs.bindings).to be_empty
+    expect(catalogs.helper_catalogs).to eq({})
+  end
+
+  ["catalog:", "catalog:missing"].each do |reference|
+    it "does not resolve a peer-only #{reference} reference without configuration" do
+      root.content = JSON.generate(
+        "packageManager" => "yarn@4.10.1", "peerDependencies" => { "missing" => reference }
+      )
+      child.content = JSON.generate("name" => "child")
+      files.delete(config)
+      expect { catalogs.validate_update!("missing") }
+        .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+      expect(catalogs.bindings).to be_empty
+      expect(catalogs.helper_catalogs).to eq({})
+      expect { catalogs.validate_update!("unrelated") }.not_to raise_error
+    end
+  end
+
+  it "updates an unrelated dependency despite a dangling catalog peer" do
+    child.content = JSON.generate("peerDependencies" => { "missing" => "catalog:missing" })
+    expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+    expect { catalogs.validate_update!("prettier") }.not_to raise_error
+    expect { catalogs.validate_update!("missing") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+  end
+
+  it "rejects the selected catalog dependency when its peer reference points to a missing catalog" do
+    child.content = child.content.sub('"dependencies"', '"peerDependencies"').sub("catalog:", "catalog:missing")
+    expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+  end
+
+  it "rejects an ordinary development dependency also declared as a catalog peer" do
+    root.content = root.content.sub("catalog:", "^2.8.0")
+    child.content = child.content.sub('"dependencies"', '"peerDependencies"')
+    expect(catalogs.bindings).to be_empty
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /peerDependencies/)
+  end
+
+  [[], "invalid", 123, true].each do |value|
+    it "reports malformed peerDependencies #{value.inspect} as a manifest parse error" do
+      child.content = JSON.generate("peerDependencies" => value)
+      expect { catalogs.bindings }
+        .to raise_error(Dependabot::DependencyFileNotParseable, /peerDependencies must be an object/) do |error|
+          expect(error.file_path).to eq(child.path)
+        end
+    end
+  end
+
+  it "reports invalid manifest JSON with the file path" do
+    child.content = "{"
+    expect { catalogs.bindings }.to raise_error(Dependabot::DependencyFileNotParseable) do |error|
+      expect(error.file_path).to eq(child.path)
+    end
+  end
+
+  it "does not disguise unexpected reader TypeErrors as malformed manifests" do
+    reader_class = Dependabot::Package::NpmPackageJson
+    allow(reader_class).to receive(:from_file).and_call_original
+    allow(reader_class).to receive(:from_file).with(child).and_raise(TypeError, "unexpected reader failure")
+    expect { catalogs.bindings }.to raise_error(TypeError, "unexpected reader failure")
+  end
+
+  it "allows ordinary peer declarations alongside catalog development dependencies" do
+    child.content = child.content.sub('"dependencies"', '"peerDependencies"').sub("catalog:", "^2.8.0")
+    expect { catalogs.validate_update!("prettier") }.not_to raise_error
+  end
+
+  it "rejects the same package consumed through multiple catalogs" do
+    child.content = child.content.sub("catalog:", "catalog:unused")
+    expect(catalogs.bindings.map(&:reference)).to eq(["catalog:", "catalog:unused"])
+    expect { catalogs.validate_update!("prettier") }
+      .to raise_error(Dependabot::ToolFeatureNotSupported, /multiple catalog bindings/)
+  end
+
+  %w(
+    workspace:* npm:prettier@2.8.0 latest git+https://example.com/prettier.git file:../prettier ../prettier
+  ).each do |range|
+    it "rejects the non-registry catalog requirement #{range}" do
+      config.content = "catalog: {prettier: #{range.to_json}}\n"
+      expect { catalogs.validate_update!("prettier") }
+        .to raise_error(Dependabot::ToolFeatureNotSupported, /non-registry/)
+    end
+  end
+
+  it "fails the inventory for a dangling optional reference even when other bindings are valid" do
+    child.content = JSON.generate("optionalDependencies" => { "missing" => "catalog:" })
+    expect { catalogs.bindings }
+      .to raise_error(Dependabot::DependencyFileNotResolvable, /missing@catalog:.*entry missing/)
+  end
+
+  context "with root resolutions" do
+    let(:resolutions) { {} }
+
+    before do
+      manifest = JSON.parse(root.content)
+      manifest["resolutions"] = resolutions
+      root.content = JSON.generate(manifest)
+    end
+
+    %w(prettier prettier@catalog: catalog-child/prettier catalog-workspace@workspace:./prettier@catalog:).each do |key|
+      context "when #{key} redirects a consuming workspace" do
+        let(:resolutions) { { key => "workspace:packages/local" } }
+
+        it "excludes that package even if another workspace uses the same catalog normally" do
+          expect(catalogs.helper_catalogs).to be_empty
+          expect(catalogs.overridden?("prettier")).to be(true)
+          expect { catalogs.validate_update!("prettier") }
+            .to raise_error(Dependabot::ToolFeatureNotSupported, /overridden by root resolutions/)
+          expect { catalogs.validate_update!("other") }.not_to raise_error
+        end
+      end
+    end
+
+    it "matches a scoped consumer, scoped target and named catalog without resolving its shadowed definition" do
+      root.content = JSON.generate(
+        "name" => "@test/root",
+        "packageManager" => "yarn@4.10.1",
+        "dependencies" => { "@test/local" => "catalog:team" },
+        "resolutions" => { "@test/root/@test/local@catalog:team" => "workspace:*" }
+      )
+      expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+      expect(catalogs.overridden?("@test/local")).to be(true)
+      expect { catalogs.validate_update!("prettier") }.not_to raise_error
+    end
+
+    it "matches Yarn's generated ident for an unnamed root workspace" do
+      manifest = JSON.parse(root.content).except("name")
+      manifest["resolutions"] = { "root-workspace-0b6124/prettier" => "workspace:*" }
+      root.content = JSON.generate(manifest)
+      expect(catalogs.overridden?("prettier")).to be(true)
+    end
+
+    context "when a rule addresses a different requester, locator, or descriptor" do
+      let(:resolutions) do
+        { "another/prettier" => "workspace:*", "catalog-child@npm:1.0.0/prettier" => "workspace:*",
+          "prettier@catalog:unused" => "workspace:*", "prettier@npm:2.8.0" => "workspace:*" }
+      end
+
+      it "keeps the binding and distinguishes a possible transitive resolution from a direct override" do
+        expect(catalogs.resolution_targets?("prettier")).to be(true)
+        expect(catalogs.resolution_targets?("other")).to be(false)
+        expect(catalogs.overridden?("prettier")).to be(false)
+        expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+      end
+    end
+
+    %w(*/prettier **/prettier catalog-child@workspace:packages/child/prettier).each do |key|
+      context "with the invalid Yarn selector #{key}" do
+        let(:resolutions) { { key => "workspace:*" } }
+
+        it "ignores the selector during catalog and transitive checks" do
+          expect(catalogs.resolution_targets?("prettier")).to be(false)
+          expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+        end
+      end
+    end
+
+    context "when the first matching resolution preserves the original reference" do
+      let(:resolutions) { { "prettier@catalog:" => "catalog:", "prettier" => "workspace:*" } }
+
+      it "keeps the binding" do
+        expect(catalogs.overridden?("prettier")).to be(false)
+        expect(catalogs.helper_catalogs).to eq("catalog:" => { "prettier" => "2.8.0" })
+      end
+    end
+  end
+
+  context "when a catalog range resolves to a local workspace" do
+    # The lockfile is generated by running yarn install with Yarn 4.10.1.
+    let(:files) { project_dependency_files("yarn_berry/catalog_local_workspace") }
+
+    it "matches the generated npm descriptor and rejects the update" do
+      binding = catalogs.bindings.first
+      expect(catalogs.lockfile_details(binding).resolution).to eq("prettier@workspace:packages/child")
+      expect(catalogs.workspace_dependency?(binding)).to be(true)
+      expect { catalogs.validate_update!("prettier") }
+        .to raise_error(Dependabot::ToolFeatureNotSupported, /local workspace/)
+    end
+  end
+
+  describe "#validate_yarn_version!" do
+    %w(4.9.9 4.10.0-rc.1).each do |version|
+      it "rejects Yarn #{version} without native catalog support" do
+        expect { catalogs.validate_yarn_version!(version) }
+          .to raise_error(Dependabot::ToolFeatureNotSupported, /native catalogs/)
+      end
+    end
+
+    %w(4.10.0 4.10.1 5.0.0).each do |version|
+      it "accepts Yarn #{version} with native catalog support" do
+        expect { catalogs.validate_yarn_version!(version) }.not_to raise_error
+      end
+    end
   end
 end

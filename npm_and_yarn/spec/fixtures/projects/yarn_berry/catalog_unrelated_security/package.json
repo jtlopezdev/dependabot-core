@@ -1,0 +1,11 @@
+{
+  "name": "project",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "packageManager": "yarn@4.10.1",
+  "dependencies": {
+    "strip-ansi": "6.0.0"
+  }
+}

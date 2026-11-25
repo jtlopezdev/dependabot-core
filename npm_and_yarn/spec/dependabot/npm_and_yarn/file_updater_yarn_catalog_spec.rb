@@ -35,6 +35,7 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater do
       end
       expect { Dependabot::NpmAndYarn::Helpers.run_yarn_command("install --immutable --mode=skip-build") }
         .not_to raise_error
+      yield if block_given?
     end
   end
 
@@ -139,6 +140,28 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater do
     end
   end
 
+  context "when a root resolution redirects another catalog dependency to a workspace" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+    def installed_version(name, from:)
+      command = ["node", "-p", "require(process.argv[1]).version", "#{name}/package.json"]
+      IO.popen(command, chdir: from, &:read).strip
+    end
+
+    it "updates the version loaded by the consumer while preserving the override and its transitive counterpart" do
+      updated = updater.updated_dependency_files
+      expect(updated.map(&:name)).to contain_exactly(".yarnrc.yml", "yarn.lock")
+      config = files.find { |file| file.name == ".yarnrc.yml" }
+      expect(updated.find { |file| file.name == config.name }.content).to eq(config.content.sub('"2.8.0"', '"^2.8.6"'))
+
+      expect_immutable_install(updated) do
+        expect(installed_version("prettier", from: "packages/number")).to eq("2.8.6")
+        expect(installed_version("is-number", from: ".")).to eq("9.0.0")
+        expect(installed_version("is-number", from: "node_modules/is-odd")).to eq("4.0.0")
+      end
+    end
+  end
+
   context "when the catalog resolves to a local workspace" do
     let(:files) { project_dependency_files("yarn_berry/catalog_transparent_workspace") }
     let(:dependency) do
@@ -158,6 +181,16 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater do
       expect(Dependabot::NpmAndYarn::Helpers).not_to receive(:run_yarn_command)
       expect { updater.updated_dependency_files }
         .to raise_error(Dependabot::ToolFeatureNotSupported, /local workspace/)
+    end
+
+    context "with a direct resolution override and a matching transitive registry descriptor" do
+      let(:files) { project_dependency_files("yarn_berry/catalog_resolution_override") }
+
+      it "declines a stale catalog update before invoking Yarn" do
+        expect(Dependabot::NpmAndYarn::Helpers).not_to receive(:run_yarn_command)
+        expect { updater.updated_dependency_files }
+          .to raise_error(Dependabot::ToolFeatureNotSupported, /resolution/)
+      end
     end
   end
 
