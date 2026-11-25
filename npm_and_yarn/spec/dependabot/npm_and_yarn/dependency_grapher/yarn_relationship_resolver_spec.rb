@@ -82,6 +82,13 @@ RSpec.describe Dependabot::NpmAndYarn::DependencyGrapher::YarnRelationshipResolv
       expect(resolver.independent_of_catalogs?("elsewhere") { false }).to be(false)
     end
 
+    it "requires a mapping for installed catalog edges even outside the discovered workspaces" do
+      result["nested@workspace:packages/tools/child"] = {
+        "version" => "0.0.0-use.local", "dependencies" => { "b" => "catalog:unseen" }
+      }
+      expect(resolver.independent_of_catalogs?("elsewhere") { false }).to be(false)
+    end
+
     it "keeps a potential resolution override on a catalog descendant out of the ordinary path" do
       expect(resolver.independent_of_catalogs?("elsewhere") { |name| name == "b" }).to be(false)
     end

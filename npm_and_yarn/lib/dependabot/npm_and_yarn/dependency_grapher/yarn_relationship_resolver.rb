@@ -64,10 +64,21 @@ module Dependabot
 
             record.dependencies.each { |child, range| pending << [child, range] }
           end
-          true
+          catalog_edges_known?(parsed)
         end
 
         private
+
+        # The fetcher may omit a nested workspace that Yarn installed. Its
+        # lockfile edges must also be accounted for before claiming independence.
+        sig { params(parsed: T::Hash[String, FileParser::YarnLock::Record]).returns(T::Boolean) }
+        def catalog_edges_known?(parsed)
+          parsed.each_value.all? do |record|
+            record.dependencies.all? do |name, range|
+              !range.start_with?("catalog:") || @catalogs[range]&.key?(name)
+            end
+          end
+        end
 
         sig do
           params(children: T::Hash[String, String], parsed: T::Hash[String, FileParser::YarnLock::Record])
