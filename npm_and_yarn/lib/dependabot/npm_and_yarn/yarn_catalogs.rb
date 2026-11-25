@@ -1,6 +1,9 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "digest"
+require "json"
+require "pathname"
 require "yaml"
 require "sorbet-runtime"
 require "dependabot/errors"
@@ -17,6 +20,13 @@ module Dependabot
 
       SUPPORTED_GROUPS = %w(dependencies devDependencies).freeze
       OTHER_LOCKFILES = %w(package-lock.json npm-shrinkwrap.json pnpm-lock.yaml).freeze
+
+      # Yarn Berry's resolution grammar: [parent[@locator]/]package[@range].
+      # Yarn also rejects legacy */ and **/ prefixes before parsing the selector.
+      RESOLUTION_IDENT = %r{(?:@[^/@]+/)?[^/@]+}
+      RESOLUTION_SELECTOR = %r{\A(?!\*{1,2}/)(?:(?<parent>#{RESOLUTION_IDENT})(?:@(?<locator>[^/]+))?/)?
+                               (?<package>#{RESOLUTION_IDENT})(?:@(?<range>[^/]+))?\z}x
+      ResolutionRules = T.type_alias { T::Hash[String, T::Array[[MatchData, String]]] }
 
       # Yarn uses js-yaml's failsafe schema: even unquoted scalar keys and
       # values are strings. Decode the syntax tree without Psych's coercions.
@@ -87,6 +97,9 @@ module Dependabot
       def initialize(dependency_files:)
         @dependency_files = dependency_files
         @bindings = T.let(nil, T.nilable(T::Array[Binding]))
+        @overridden_names = T.let(Set.new, T::Set[String])
+        @resolution_rules = T.let(nil, T.nilable(ResolutionRules))
+        @peer_catalog_names = T.let(Set.new, T::Set[String])
         @configuration = T.let(nil, T.nilable(T::Hash[String, Object]))
         @yarn_project = T.let(nil, T.nilable(T::Boolean))
         @lockfile_reader = T.let(nil, T.nilable(FileParser::YarnLock))
@@ -94,8 +107,7 @@ module Dependabot
 
       sig { returns(T.nilable(DependencyFile)) }
       def config_file
-        @dependency_files.find { |file| file.name == ".yarnrc.yml" } ||
-          @dependency_files.find { |file| file.name.end_with?("/.yarnrc.yml") }
+        @dependency_files.find { |file| file.name == ".yarnrc.yml" }
       end
 
       sig { returns(T::Array[Binding]) }
@@ -103,30 +115,42 @@ module Dependabot
         return @bindings if @bindings
         return @bindings = [] unless yarn_project?
 
-        entries = T.let({}, T::Hash[[String, String], Binding])
+        entries = T.let({}, T::Hash[[String, String], T::Array[String]])
         manifest_files.each do |file|
-          Dependabot::Package::NpmPackageJson.from_file(file).each_dependency do |name, reference, group|
-            next unless reference.start_with?("catalog:")
-
-            key = [name, reference]
-            binding = entries[key] ||= Binding.new(
-              name: name, reference: reference, requirement: resolve(name, reference), groups: []
-            )
-            binding.groups << group unless binding.groups.include?(group)
+          catalog_references(file).each do |name, reference, group|
+            groups = entries[[name, reference]] ||= []
+            groups << group unless groups.include?(group)
           end
         end
-        @bindings = entries.values
+        # A shared catalog entry is unsafe to edit if any consumer is overridden.
+        entries.reject! { |(name, _), _| @overridden_names.include?(name) }
+        @bindings = entries.map do |(name, reference), groups|
+          Binding.new(name: name, reference: reference, requirement: resolve(name, reference), groups: groups)
+        end
+      end
+
+      sig { params(name: String).returns(T::Boolean) }
+      def overridden?(name)
+        bindings
+        @overridden_names.include?(name)
+      end
+
+      sig { params(name: String).returns(T::Boolean) }
+      def resolution_targets?(name)
+        resolution_rules.key?(name)
       end
 
       sig { returns(T::Boolean) }
       def yarn_project?
         return @yarn_project unless @yarn_project.nil?
 
+        # Catalog inventory respects an explicit manager pin and rejects mixed
+        # projects rather than choosing a manager by lockfile precedence.
         root = @dependency_files.find { |file| file.name == "package.json" }
         pin = root && Dependabot::Package::NpmPackageJson.from_file(root).package_manager_config.package_manager
         return @yarn_project = pin.start_with?("yarn@") if pin
 
-        @yarn_project = @dependency_files.any? { |file| file.name.end_with?("yarn.lock") } &&
+        @yarn_project = @dependency_files.any? { |file| file.name == "yarn.lock" } &&
                         @dependency_files.none? do |file|
                           OTHER_LOCKFILES.include?(file.name) || file.name == "pnpm-workspace.yaml"
                         end
@@ -157,7 +181,7 @@ module Dependabot
 
       sig { params(binding: Binding).returns(T.nilable(Dependabot::Package::NpmLockfileDetails)) }
       def lockfile_details(binding)
-        lock = @dependency_files.find { |file| file.name.end_with?("yarn.lock") }
+        lock = @dependency_files.find { |file| file.name == "yarn.lock" }
         return unless lock
 
         @lockfile_reader ||= FileParser::YarnLock.new(lock)
@@ -172,6 +196,8 @@ module Dependabot
       sig { params(name: String).void }
       def validate_update!(name)
         selected = bindings.select { |binding| binding.name == name }
+        unsupported!(name, "catalog requirements in peerDependencies") if @peer_catalog_names.include?(name)
+        unsupported!(name, "catalog reference overridden by root resolutions") if overridden?(name)
         return if selected.empty?
 
         unsupported!(name, "multiple catalog bindings") unless selected.one?
@@ -202,6 +228,71 @@ module Dependabot
       end
 
       private
+
+      sig { params(file: DependencyFile).returns(T::Array[[String, String, String]]) }
+      def catalog_references(file)
+        references = T.let([], T::Array[[String, String, String]])
+        manifest = Dependabot::Package::NpmPackageJson.from_file(file)
+        manifest.each_dependency(include_peer_dependencies: true) do |name, reference, group|
+          next unless reference.start_with?("catalog:")
+
+          # Yarn doesn't resolve peers, and a root resolution can bypass the catalog.
+          if group == "peerDependencies"
+            @peer_catalog_names << name
+          elsif overridden_reference?(file, manifest.name, name, reference)
+            @overridden_names << name
+          else
+            references << [name, reference, group]
+          end
+        end
+        references
+      rescue JSON::ParserError, Dependabot::Package::NpmPackageJson::InvalidManifestError => e
+        raise DependencyFileNotParseable.new(file.path, e.message)
+      end
+
+      sig { returns(ResolutionRules) }
+      def resolution_rules
+        return @resolution_rules if @resolution_rules
+
+        root = @dependency_files.find { |file| file.name == "package.json" }
+        raw = JSON.parse(T.must(root.content))["resolutions"] if root
+        rules = T.let({}, ResolutionRules)
+        if raw.is_a?(Hash)
+          raw.each do |selector, target|
+            pattern = RESOLUTION_SELECTOR.match(selector)
+            next unless target.is_a?(String) && pattern
+
+            (rules[T.must(pattern[:package])] ||= []) << [pattern, target]
+          end
+        end
+        @resolution_rules = rules
+      end
+
+      sig do
+        params(file: DependencyFile, workspace: T.nilable(String), name: String, reference: String).returns(T::Boolean)
+      end
+      def overridden_reference?(file, workspace, name, reference)
+        rules = resolution_rules[name]
+        return false unless rules
+
+        directory = Pathname.new(file.name).dirname.cleanpath.to_s
+        workspace ||= generated_workspace_name(directory)
+
+        # CorePlugin applies the first matching resolution before the catalog plugin runs.
+        match = rules.find do |pattern, _|
+          (pattern[:parent].nil? || pattern[:parent] == workspace) &&
+            (pattern[:locator].nil? || pattern[:locator] == "workspace:#{directory}") &&
+            (pattern[:range].nil? || pattern[:range] == reference)
+        end
+        !match.nil? && match.last != reference
+      end
+
+      # Yarn generates an ident for unnamed workspaces from their project-relative path.
+      sig { params(directory: String).returns(String) }
+      def generated_workspace_name(directory)
+        basename = directory == "." ? "root-workspace" : File.basename(directory)
+        "#{basename}-#{Digest::SHA512.hexdigest(directory)[0, 6]}"
+      end
 
       sig { params(name: String).void }
       def validate_project!(name)
