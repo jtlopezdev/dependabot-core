@@ -61,7 +61,7 @@ module Dependabot
 
             if dependency_files_builder.yarn_locks.any?
               enable_normalized_yarn_traversal =
-                Dependabot::Experiments.enabled?(:enable_yarn_berry_conflicting_dependencies)
+                yarn_catalogs.any? || Dependabot::Experiments.enabled?(:enable_yarn_berry_conflicting_dependencies)
 
               # Normalized traversal needs the target's lockfile entries to tell
               # its locked instances apart.
@@ -153,11 +153,14 @@ module Dependabot
         )
           args = T.let(
             [Dir.pwd, dependency.name, target_version.to_s],
-            T::Array[T.any(String, T::Boolean, T::Array[String])]
+            T::Array[T.any(String, T::Boolean, T::Array[String], T::Hash[String, T::Hash[String, String]])]
           )
           if function == "yarn:findConflictingDependencies"
             args << enable_normalized_yarn_traversal
-            args << affected_versions if enable_normalized_yarn_traversal && affected_versions.any?
+            if (enable_normalized_yarn_traversal && affected_versions.any?) || yarn_catalogs.any?
+              args << affected_versions
+            end
+            args << yarn_catalogs if yarn_catalogs.any?
           end
 
           T.cast(
@@ -172,6 +175,11 @@ module Dependabot
           raise if enable_normalized_yarn_traversal
 
           []
+        end
+
+        sig { returns(T::Hash[String, T::Hash[String, String]]) }
+        def yarn_catalogs
+          YarnCatalogs.new(dependency_files: dependency_files).helper_catalogs
         end
 
         sig { returns(T::Array[Dependabot::DependencyFile]) }

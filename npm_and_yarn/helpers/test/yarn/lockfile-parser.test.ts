@@ -4,6 +4,7 @@ import fs from "fs";
 import {
   edgeKey,
   findEntries,
+  normalizeDependencyEdge,
   normalizeDescriptor,
   parseNormalized,
   type NormalizedLockfileEntry,
@@ -102,6 +103,68 @@ describe("parseNormalized", () => {
     );
     return parseNormalized(tempDir);
   };
+
+  it("keeps unnamed and named default catalogs bound to their exact descriptors", async () => {
+    helpers.copyDependencies(
+      "conflicting-dependency-parser/berry-workspace",
+      tempDir
+    );
+    const manifestPath = path.join(tempDir, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest.dependencies = { objnest: "catalog:" };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const lockPath = path.join(tempDir, "yarn.lock");
+    fs.writeFileSync(
+      lockPath,
+      fs
+        .readFileSync(lockPath, "utf8")
+        .replace('objnest: "npm:^4.1.2"', 'objnest: "catalog:default"')
+        .replace(
+          'local-pkg: "workspace:*"',
+          'local-pkg: "workspace:*"\n    objnest: "catalog:"'
+        ) +
+        '\n"objnest@npm:^5.0.0":\n  version: 5.0.10\n  resolution: "objnest@npm:5.0.10"\n'
+    );
+    const catalogs = {
+      "catalog:": { objnest: "^5.0.0" },
+      "catalog:default": { objnest: "^4.1.2" },
+    };
+    const lockfile = await parseNormalized(tempDir, catalogs);
+    const root = findEntries(lockfile, {
+      name: "test",
+      requirement: "workspace:.",
+    })[0];
+    const child = findEntries(lockfile, {
+      name: "local-pkg",
+      requirement: "workspace:*",
+    })[0];
+    expect(root.dependencies).toEqual([
+      { name: "local-pkg", requirement: "workspace:*" },
+      { name: "objnest", requirement: "^5.0.0" },
+    ]);
+    expect(child.dependencies).toEqual([
+      { name: "objnest", requirement: "^4.1.2" },
+    ]);
+    for (const [reference, version] of [
+      ["catalog:", "5.0.10"],
+      ["catalog:default", "4.1.4"],
+    ]) {
+      const edge = normalizeDependencyEdge(
+        "objnest",
+        reference,
+        lockfile,
+        catalogs
+      );
+      expect(findEntries(lockfile, edge).map((entry) => entry.version)).toEqual(
+        [version]
+      );
+    }
+    expect(() =>
+      normalizeDependencyEdge("objnest", "catalog:default", lockfile, {
+        "catalog:": catalogs["catalog:"],
+      })
+    ).toThrow(/objnest@catalog:default: catalog entry missing/);
+  });
 
   it("returns dependency edges for yarn v1 lockfiles", async () => {
     const lockfile = await parseFixture("simple");

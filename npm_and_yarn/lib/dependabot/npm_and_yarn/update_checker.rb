@@ -4,6 +4,7 @@
 require "dependabot/git_commit_checker"
 require "dependabot/requirements_update_strategy"
 require "dependabot/shared_helpers"
+require "dependabot/npm_and_yarn/dependency_grapher"
 require "dependabot/npm_and_yarn/helpers"
 require "dependabot/npm_and_yarn/package_manager"
 require "dependabot/update_checkers"
@@ -70,6 +71,13 @@ module Dependabot
         @package_json = T.let(nil, T.nilable(Dependabot::DependencyFile))
         @git_commit_checker = T.let(nil, T.nilable(Dependabot::GitCommitChecker))
         super
+        catalogs = YarnCatalogs.new(dependency_files: dependency_files)
+        catalogs.validate_update!(dependency.name)
+        if security_advisories.any? && catalog_security_update?(catalogs)
+          raise ToolFeatureNotSupported.new(
+            tool_name: "yarn", tool_type: "package_manager", feature: "security updates for Yarn catalogs"
+          )
+        end
         Helpers.dependency_files = dependency_files
         Helpers.credentials = credentials
         Helpers.activate_npm_version_selector(dependency_files)
@@ -229,6 +237,18 @@ module Dependabot
       end
 
       private
+
+      sig { params(catalogs: YarnCatalogs).returns(T::Boolean) }
+      def catalog_security_update?(catalogs)
+        return false if catalogs.bindings.empty?
+        return catalogs.bindings.any? { |binding| binding.name == dependency.name } if dependency.top_level?
+
+        lock = dependency_files.find { |file| file.name == "yarn.lock" }
+        return true unless lock
+
+        graph = DependencyGrapher::YarnRelationshipResolver.new(lock, catalogs: catalogs.helper_catalogs)
+        !graph.independent_of_catalogs?(dependency.name) { |name| catalogs.resolution_targets?(name) }
+      end
 
       sig { returns(T::Boolean) }
       def vulnerability_audit_performed?

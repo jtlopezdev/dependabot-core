@@ -53,6 +53,10 @@ export interface DependencyEdge {
   realName?: string;
 }
 
+// Catalog semantics and ownership are resolved by Ruby, which supplies the
+// effective ranges used by both manifest and workspace edges.
+export type YarnCatalogs = Record<string, Record<string, string>>;
+
 export interface NormalizedLockfileEntry extends DependencyEdge {
   version: string;
   resolved?: string;
@@ -82,9 +86,10 @@ const lockfileIndexes = new WeakMap<NormalizedLockfileEntry[], LockfileIndex>();
 // `foo-alias@npm:foo@^1.0.0`. Keying would discard one of the resolutions along
 // with its dependency subtree.
 export async function parseNormalized(
-  directory: string
+  directory: string,
+  catalogs: YarnCatalogs = {}
 ): Promise<NormalizedLockfileEntry[]> {
-  return normalizeLockfile(await parse(directory));
+  return normalizeLockfile(await parse(directory), catalogs);
 }
 
 // Resolves a `name`/`requirement` descriptor pair into a dependency edge.
@@ -161,8 +166,15 @@ export function findEntries(
 export function normalizeDependencyEdge(
   name: string,
   requirement: string,
-  lockfile: NormalizedLockfileEntry[]
+  lockfile: NormalizedLockfileEntry[],
+  catalogs: YarnCatalogs = {}
 ): DependencyEdge {
+  if (requirement.startsWith("catalog:")) {
+    const effectiveRange = catalogs[requirement]?.[name];
+    if (!effectiveRange)
+      throw new Error(`${name}@${requirement}: catalog entry missing`);
+    requirement = effectiveRange;
+  }
   const matchingEntries = findEntries(lockfile, { name, requirement });
   const realNames = new Set(
     matchingEntries
@@ -238,7 +250,8 @@ function addIndexedEntry(
 }
 
 function normalizeLockfile(
-  lockfileJson: Record<string, LockfileEntry>
+  lockfileJson: Record<string, LockfileEntry>,
+  catalogs: YarnCatalogs
 ): NormalizedLockfileEntry[] {
   const normalized: NormalizedLockfileEntry[] = [];
   const pendingDependencies: {
@@ -281,7 +294,8 @@ function normalizeLockfile(
   for (const pending of pendingDependencies) {
     pending.entry.dependencies = normalizeDependencies(
       [pending.dependencies, pending.optionalDependencies],
-      normalized
+      normalized,
+      catalogs
     );
   }
 
@@ -293,11 +307,12 @@ function normalizeLockfile(
 // `foo-v2: npm:foo@^2.0.0`) are all preserved instead of overwriting each other.
 function normalizeDependencies(
   dependencyGroups: (Record<string, string> | undefined)[],
-  lockfile: NormalizedLockfileEntry[]
+  lockfile: NormalizedLockfileEntry[],
+  catalogs: YarnCatalogs
 ): DependencyEdge[] {
   return dependencyGroups.flatMap((dependencies) =>
     Object.entries(dependencies ?? {}).map(([name, spec]) =>
-      normalizeDependencyEdge(name, spec, lockfile)
+      normalizeDependencyEdge(name, spec, lockfile, catalogs)
     )
   );
 }

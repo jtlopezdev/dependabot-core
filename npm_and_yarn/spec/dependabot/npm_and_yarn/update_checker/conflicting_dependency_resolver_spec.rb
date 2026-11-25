@@ -50,6 +50,21 @@ RSpec.describe(Dependabot::NpmAndYarn::UpdateChecker::ConflictingDependencyResol
       )
     end
 
+    context "with a catalog-backed ancestor and the unrelated traversal experiment disabled" do
+      let(:dependency_files) { project_dependency_files("yarn_berry/catalog_security") }
+      let(:dependency_name) { "is-number" }
+      let(:current_version) { "4.0.0" }
+      let(:target_version) { "6.0.0" }
+      let(:enable_yarn_berry_conflicting_dependencies) { false }
+
+      it "finds the vulnerable transitive dependency through the catalog range" do
+        expect(conflicting_dependencies).to contain_exactly(
+          hash_including("name" => "is-odd", "version" => "2.0.0", "requirement" => "^4.0.0"),
+          hash_including("name" => "is-odd", "version" => "2.0.0", "requirement" => "^4.0.0")
+        )
+      end
+    end
+
     context "with npm lockfiles" do
       let(:dependency_files) { project_dependency_files("npm6/subdependency_out_of_range_gt") }
 

@@ -10,9 +10,17 @@ module Dependabot
       class YarnRelationshipResolver
         extend T::Sig
 
-        sig { params(lockfile: Dependabot::DependencyFile).void }
-        def initialize(lockfile)
+        sig do
+          params(
+            lockfile: Dependabot::DependencyFile,
+            catalogs: T::Hash[String, T::Hash[String, String]],
+            overridden_catalog: T.nilable(T.proc.params(name: String).returns(T::Boolean))
+          ).void
+        end
+        def initialize(lockfile, catalogs: {}, overridden_catalog: nil)
           @lockfile = lockfile
+          @catalogs = catalogs
+          @overridden_catalog = overridden_catalog
         end
 
         sig { returns(T::Hash[String, T::Array[String]]) }
@@ -34,7 +42,43 @@ module Dependabot
           end
         end
 
+        # Security updates can follow the ordinary path only when every edge below
+        # a consumed catalog entry resolves exactly, without reaching the target.
+        sig do
+          params(target: String, _overridden: T.proc.params(name: String).returns(T::Boolean)).returns(T::Boolean)
+        end
+        def independent_of_catalogs?(target, &_overridden)
+          parsed = FileParser::YarnLock.new(@lockfile).parsed
+          pending = T.let([], T::Array[[String, String]])
+          @catalogs.each do |reference, entries|
+            entries.each_key { |name| pending << [name, catalog_requirement(name, reference)] }
+          end
+          visited = T.let(Set.new, T::Set[FileParser::YarnLock::Record])
+          while (edge = pending.pop)
+            name, requirement = edge
+            return false if name == target || yield(name)
+
+            record = descriptor_record("#{name}@#{requirement}", parsed)
+            return false unless record && record.lookup_details.resolution.to_s.start_with?("#{name}@npm:")
+            next unless visited.add?(record)
+
+            record.dependencies.each { |child, range| pending << [child, range] }
+          end
+          catalog_edges_known?(parsed)
+        end
+
         private
+
+        # The fetcher may omit a nested workspace that Yarn installed. Its
+        # lockfile edges must also be accounted for before claiming independence.
+        sig { params(parsed: T::Hash[String, FileParser::YarnLock::Record]).returns(T::Boolean) }
+        def catalog_edges_known?(parsed)
+          parsed.each_value.all? do |record|
+            record.dependencies.all? do |name, range|
+              !range.start_with?("catalog:") || @catalogs[range]&.key?(name)
+            end
+          end
+        end
 
         sig do
           params(children: T::Hash[String, String], parsed: T::Hash[String, FileParser::YarnLock::Record])
@@ -42,6 +86,9 @@ module Dependabot
         end
         def resolve_children(children, parsed)
           children.filter_map do |child_name, child_req|
+            # Submission can omit an overridden catalog edge while retaining the other relationships.
+            next if child_req.start_with?("catalog:") && @overridden_catalog&.call(child_name)
+
             version = resolve_child_version(child_name, child_req, parsed)
             "#{child_name}@#{version}" if version
           end
@@ -52,20 +99,35 @@ module Dependabot
             .returns(T.nilable(String))
         end
         def resolve_child_version(child_name, child_req, parsed)
-          # Try exact key first
-          child_entry = parsed["#{child_name}@#{child_req}"]
-          return child_entry.version if child_entry&.version
+          catalog_reference = child_req if child_req.start_with?("catalog:")
+          child_req = catalog_requirement(child_name, child_req) if catalog_reference
+          version = descriptor_record("#{child_name}@#{child_req}", parsed)&.version
+          return version if version
 
-          # Yarn groups multiple requirements into single keys like "foo@^1.0.0, foo@^1.2.0"
-          target_req = "#{child_name}@#{child_req}"
-          grouped_match = parsed.find { |k, _| k.split(", ").include?(target_req) }
-          grouped_version = grouped_match&.last&.version
-          return grouped_version if grouped_version
+          if catalog_reference
+            raise DependencyFileNotResolvable, "#{child_name}@#{catalog_reference}: matching lockfile entry missing"
+          end
 
           # Fallback: find by name only if there's exactly one candidate
           candidates = parsed.select { |k, _| k.split(/(?<=\w)\@/).first == child_name }
           candidate = candidates.first
           candidate.last.version if candidates.size == 1 && candidate
+        end
+
+        sig do
+          params(descriptor: String, parsed: T::Hash[String, FileParser::YarnLock::Record])
+            .returns(T.nilable(FileParser::YarnLock::Record))
+        end
+        def descriptor_record(descriptor, parsed)
+          parsed[descriptor] || parsed.find { |key, _| key.split(", ").include?(descriptor) }&.last
+        end
+
+        sig { params(name: String, reference: String).returns(String) }
+        def catalog_requirement(name, reference)
+          range = @catalogs.dig(reference, name)
+          raise DependencyFileNotResolvable, "#{name}@#{reference}: catalog entry missing" unless range
+
+          range.match?(/\A[a-z]+:/) ? range : "npm:#{range}"
         end
       end
     end

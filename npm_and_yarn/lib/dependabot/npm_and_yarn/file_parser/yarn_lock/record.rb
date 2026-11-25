@@ -37,7 +37,7 @@ module Dependabot
 
           sig { returns(T::Hash[String, String]) }
           def dependencies
-            dependency_requirements || {}
+            (dependency_requirements || {}).merge(optional_dependencies || {})
           end
 
           sig { returns(T.nilable(T::Hash[String, String])) }

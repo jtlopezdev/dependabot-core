@@ -1,0 +1,10 @@
+{
+  "name": "catalog-security-child",
+  "private": true,
+  "dependencies": {
+    "is-odd": "catalog:math"
+  },
+  "devDependencies": {
+    "prettier": "2.8.6"
+  }
+}

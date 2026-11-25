@@ -1,0 +1,11 @@
+{
+  "name": "catalog-test",
+  "private": true,
+  "packageManager": "yarn@4.18.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "is-number": "catalog:"
+  }
+}

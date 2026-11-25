@@ -1,0 +1,8 @@
+{
+  "name": "is-number",
+  "version": "9.0.0",
+  "private": true,
+  "devDependencies": {
+    "prettier": "catalog:"
+  }
+}

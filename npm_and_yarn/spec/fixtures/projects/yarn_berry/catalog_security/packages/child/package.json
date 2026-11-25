@@ -1,0 +1,7 @@
+{
+  "name": "catalog-security-child",
+  "private": true,
+  "dependencies": {
+    "is-odd": "catalog:math"
+  }
+}
