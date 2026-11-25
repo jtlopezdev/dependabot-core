@@ -5,6 +5,7 @@ require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_group"
 require "dependabot/job"
+require "dependabot/npm_and_yarn"
 require "dependabot/updater/group_dependency_selector"
 
 RSpec.describe Dependabot::Updater::GroupDependencySelector do
@@ -291,6 +292,88 @@ RSpec.describe Dependabot::Updater::GroupDependencySelector do
         expect(dependency_group).to receive(:contains?).at_least(:once).and_return(true)
 
         selector.filter_to_group!(dependency_change)
+      end
+    end
+
+    context "with a verified catalog security update and the real job policy" do
+      let(:dependency_group) do
+        Dependabot::DependencyGroup.new(
+          name: "catalog-security", applies_to: "security-updates", rules: { "patterns" => ["is-number"] }
+        )
+      end
+      let(:job) do
+        Dependabot::Job.new(
+          id: "catalog-security",
+          package_manager: "npm_and_yarn",
+          dependencies: ["is-number"],
+          allowed_updates: [{ "dependency-type" => "all", "update-type" => "security" }],
+          existing_pull_requests: [],
+          ignore_conditions: [],
+          security_advisories: [{ "dependency-name" => "is-number", "affected-versions" => [">= 4.0.0 < 6.0.0"] }],
+          source: { "provider" => "github", "repo" => "test/repo", "directory" => "/api" },
+          lockfile_only: false,
+          security_updates_only: true,
+          update_subdependencies: false,
+          updating_a_pull_request: false,
+          requirements_update_strategy: nil
+        )
+      end
+      let(:metadata) do
+        {
+          information_only: true,
+          yarn_catalog_security_previous_versions: %w(2.1.0 4.0.0),
+          yarn_catalog_security_contracts: [{
+            "target" => "is-number", "versions" => %w(2.1.0 6.0.0),
+            "retained_versions" => ["2.1.0"], "retained_edges" => []
+          }]
+        }
+      end
+      let(:updated_dependency) do
+        Dependabot::Dependency.new(
+          name: "is-number",
+          package_manager: "npm_and_yarn",
+          version: "2.1.0",
+          previous_version: "2.1.0",
+          requirements: [],
+          previous_requirements: [],
+          metadata: metadata
+        )
+      end
+      let(:dependency_change) do
+        Dependabot::DependencyChange.new(
+          job: job,
+          updated_dependencies: [updated_dependency],
+          updated_dependency_files: [Dependabot::DependencyFile.new(name: "yarn.lock", content: "", directory: "/api")]
+        )
+      end
+
+      it "retains the fixed inventory when its safe representative stays unchanged" do
+        expect(job.allowed_update?(updated_dependency, check_previous_version: true)).to be(true)
+        selector.filter_to_group!(dependency_change)
+        expect(dependency_change.updated_dependencies).to eq([updated_dependency])
+      end
+
+      it "still filters a safe previous representative without verified catalog provenance" do
+        metadata.delete(:yarn_catalog_security_contracts)
+        selector.filter_to_group!(dependency_change)
+        expect(dependency_change.updated_dependencies).to be_empty
+      end
+
+      it "retains an informational removal that fixes the original vulnerable inventory" do
+        metadata[:yarn_catalog_security_contracts].first["versions"] = []
+        removed = Dependabot::Dependency.new(
+          name: "is-number",
+          package_manager: "npm_and_yarn",
+          previous_version: "2.1.0",
+          requirements: [],
+          previous_requirements: [],
+          removed: true,
+          metadata: metadata
+        )
+        dependency_change.updated_dependencies.replace([removed])
+        selector.filter_to_group!(dependency_change)
+        expect(dependency_change.updated_dependencies).to eq([removed])
+        expect(dependency_change).to be_all_have_previous_version
       end
     end
   end

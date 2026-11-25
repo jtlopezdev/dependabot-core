@@ -1,6 +1,8 @@
 # typed: strong
 # frozen_string_literal: true
 
+require "dependabot/updater/yarn_catalog_update_checker_options"
+
 require "dependabot/updater/security_update_helpers"
 require "dependabot/notices"
 
@@ -246,7 +248,10 @@ module Dependabot
             raise_on_ignored: true, # always true for security updates
             requirements_update_strategy: job.requirements_update_strategy,
             # exclude_paths: job.exclude_paths,
-            options: job.experiments
+            options: YarnCatalogUpdateCheckerOptions.for(
+              job: job,
+              dependency_files: dependency_snapshot.dependency_files
+            )
           )
         end
 

@@ -66,6 +66,89 @@ RSpec.describe Dependabot::DependencyChangeBuilder do
     [build_dependency(name: "dummy-pkg-b", version: "1.2.0", previous_version: "1.1.0")]
   end
 
+  describe "#run with a verified catalog security inventory" do
+    subject(:change) { builder.run }
+
+    let(:builder) do
+      described_class.new(
+        job: job,
+        dependency_files: dependency_files,
+        updated_dependencies: [informational, ancestor],
+        change_source: Dependabot::DependencyGroup.new(name: "security", rules: { "patterns" => ["*"] }),
+        notices: []
+      )
+    end
+    let(:package_manager) { "npm_and_yarn" }
+    let(:metadata) do
+      {
+        information_only: true,
+        yarn_catalog_security_previous_versions: %w(2.1.0 4.0.0),
+        yarn_catalog_security_contracts: [{
+          "target" => "is-number", "versions" => %w(2.1.0 6.0.0),
+          "retained_versions" => ["2.1.0"], "retained_edges" => []
+        }],
+        all_versions: %w(2.1.0 6.0.0).map do |version|
+          Dependabot::Dependency.new(
+            name: "is-number", package_manager: package_manager, version: version, requirements: []
+          )
+        end
+      }
+    end
+    let(:informational) do
+      Dependabot::Dependency.new(
+        name: "is-number",
+        package_manager: package_manager,
+        version: "2.1.0",
+        previous_version: "2.1.0",
+        requirements: [],
+        previous_requirements: [],
+        metadata: metadata
+      )
+    end
+    let(:ancestor) do
+      Dependabot::Dependency.new(
+        name: "is-odd",
+        package_manager: package_manager,
+        version: "3.0.1",
+        previous_version: "2.0.0",
+        requirements: [],
+        previous_requirements: []
+      )
+    end
+
+    before do
+      allow(builder).to receive(:generate_dependency_files).and_return(dependency_files.reject(&:support_file?))
+    end
+
+    it "retains the fixed child inventory when its representative stays unchanged in a group" do
+      expect(change.updated_dependencies).to eq([informational, ancestor])
+      expect(change.updated_dependencies.first.all_versions).to contain_exactly("2.1.0", "6.0.0")
+    end
+
+    it "still removes an unchanged informational dependency without a verified contract" do
+      informational.metadata.delete(:yarn_catalog_security_contracts)
+      expect(change.updated_dependencies).to eq([ancestor])
+    end
+
+    it "still removes an unchanged informational dependency without its original inventory" do
+      informational.metadata.delete(:yarn_catalog_security_previous_versions)
+      expect(change.updated_dependencies).to eq([ancestor])
+    end
+
+    it "still removes an informational dependency whose entire inventory stays unchanged" do
+      informational.metadata[:yarn_catalog_security_previous_versions] = %w(2.1.0 6.0.0)
+      expect(change.updated_dependencies).to eq([ancestor])
+    end
+
+    context "with another package manager" do
+      let(:package_manager) { "bundler" }
+
+      it "preserves the existing unchanged-dependency filtering" do
+        expect(change.updated_dependencies).to eq([ancestor])
+      end
+    end
+  end
+
   describe "::create_from" do
     subject(:create_change) do
       described_class.create_from(
