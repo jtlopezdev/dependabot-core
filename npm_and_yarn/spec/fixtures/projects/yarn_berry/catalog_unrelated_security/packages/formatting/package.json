@@ -1,0 +1,7 @@
+{
+  "name": "formatting",
+  "private": true,
+  "devDependencies": {
+    "prettier": "catalog:"
+  }
+}

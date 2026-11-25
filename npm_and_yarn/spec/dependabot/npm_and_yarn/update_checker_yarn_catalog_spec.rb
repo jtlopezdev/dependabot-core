@@ -104,6 +104,43 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
     end
   end
 
+  context "with a vulnerable transitive dependency on a separate branch from the catalog" do
+    let(:files) { project_dependency_files("yarn_berry/catalog_unrelated_security") }
+    let(:ignored_versions) { [] }
+    let(:dependency) do
+      parser = Dependabot::NpmAndYarn::FileParser.new(dependency_files: files, source: nil)
+      parser.parse.find { |dep| dep.name == "ansi-regex" }
+    end
+    let(:security_advisories) do
+      [Dependabot::SecurityAdvisory.new(
+        dependency_name: "ansi-regex", package_manager: "npm_and_yarn", vulnerable_versions: [">= 5.0.0, < 5.0.1"]
+      )]
+    end
+
+    before do
+      listing = {
+        "name" => "ansi-regex", "dist-tags" => { "latest" => "5.0.1" },
+        "versions" => %w(5.0.0 5.0.1).to_h { |version| [version, { "version" => version }] }
+      }
+      stub_request(:get, "https://registry.npmjs.org/ansi-regex").to_return(status: 200, body: listing.to_json)
+      stub_request(:get, "https://registry.npmjs.org/ansi-regex/latest").to_return(status: 200, body: "{}")
+      stub_request(:head, "https://registry.npmjs.org/ansi-regex/-/ansi-regex-5.0.1.tgz").to_return(status: 200)
+    end
+
+    it "repairs the vulnerable package in the lockfile without changing the catalog workspace" do
+      updates = checker.updated_dependencies(requirements_to_unlock: :none)
+      expect(updates.map { |dep| [dep.name, dep.version] }).to eq([["ansi-regex", "5.0.1"]])
+
+      changed = Dependabot::NpmAndYarn::FileUpdater.new(
+        dependencies: updates, dependency_files: files, credentials: [], options: { security_updates_only: true }
+      ).updated_dependency_files
+      expect(changed.map(&:name)).to eq(["yarn.lock"])
+      lock = YAML.safe_load(changed.first.content)
+      expect(lock.fetch("ansi-regex@npm:^5.0.0").fetch("version")).to eq("5.0.1")
+      expect(lock.fetch("formatting@workspace:packages/formatting").dig("dependencies", "prettier")).to eq("catalog:")
+    end
+  end
+
   context "with an unrelated ordinary security update in a catalog project" do
     let(:files) { project_dependency_files("yarn_berry/catalog_mixed_ordinary") }
     let(:security_advisories) do

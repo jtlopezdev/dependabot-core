@@ -15,8 +15,9 @@ updated together. A package consumed through multiple catalog identities, or thr
 direct declaration, reports an unsupported feature. Catalog ranges resolved to local workspaces are excluded from
 registry updates. Inherited configuration, plugin catalogs, and selected YAML aliases or anchors are also outside this scope.
 
-Catalog edges participate in dependency graph and conflict traversal. Security updates for catalog dependencies
-and transitive updates in projects using catalogs are not yet supported. Ordinary direct security updates remain available.
+Catalog edges participate in dependency graph and conflict traversal. Security updates for ordinary direct dependencies
+and transitive dependencies outside the installed catalog dependency trees remain available. Security updates for catalog
+entries, their descendants, and cases where the lockfile cannot establish that separation are not yet supported.
 
 ### Running locally
 

@@ -42,6 +42,31 @@ module Dependabot
           end
         end
 
+        # Security updates can follow the ordinary path only when every edge below
+        # a consumed catalog entry resolves exactly, without reaching the target.
+        sig do
+          params(target: String, _overridden: T.proc.params(name: String).returns(T::Boolean)).returns(T::Boolean)
+        end
+        def independent_of_catalogs?(target, &_overridden)
+          parsed = FileParser::YarnLock.new(@lockfile).parsed
+          pending = T.let([], T::Array[[String, String]])
+          @catalogs.each do |reference, entries|
+            entries.each_key { |name| pending << [name, catalog_requirement(name, reference)] }
+          end
+          visited = T.let(Set.new, T::Set[FileParser::YarnLock::Record])
+          while (edge = pending.pop)
+            name, requirement = edge
+            return false if name == target || yield(name)
+
+            record = descriptor_record("#{name}@#{requirement}", parsed)
+            return false unless record && record.lookup_details.resolution.to_s.start_with?("#{name}@npm:")
+            next unless visited.add?(record)
+
+            record.dependencies.each { |child, range| pending << [child, range] }
+          end
+          true
+        end
+
         private
 
         sig do
@@ -66,7 +91,7 @@ module Dependabot
           return if catalog_reference && @overridden_catalog&.call(child_name)
 
           child_req = catalog_requirement(child_name, child_req) if catalog_reference
-          version = descriptor_version("#{child_name}@#{child_req}", parsed)
+          version = descriptor_record("#{child_name}@#{child_req}", parsed)&.version
           return version if version
 
           if catalog_reference
@@ -79,10 +104,12 @@ module Dependabot
           candidate.last.version if candidates.size == 1 && candidate
         end
 
-        sig { params(descriptor: String, parsed: T::Hash[String, FileParser::YarnLock::Record]).returns(T.nilable(String)) }
-        def descriptor_version(descriptor, parsed)
-          entry = parsed[descriptor] || parsed.find { |key, _| key.split(", ").include?(descriptor) }&.last
-          entry&.version
+        sig do
+          params(descriptor: String, parsed: T::Hash[String, FileParser::YarnLock::Record])
+            .returns(T.nilable(FileParser::YarnLock::Record))
+        end
+        def descriptor_record(descriptor, parsed)
+          parsed[descriptor] || parsed.find { |key, _| key.split(", ").include?(descriptor) }&.last
         end
 
         sig { params(name: String, reference: String).returns(String) }
